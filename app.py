@@ -185,7 +185,7 @@ async def telegram_webhook(request: Request):
         is_admin = chat_id in ADMIN_IDS
         
         if user_text == "/start":
-            welcome_text = f"🌌 **WELCOME TO THE CYBERPUNK DISTRIBUTOR CORE** 🌌\n\n⚡ `الحالة: متصل بالشبكة الآمنة`\n🎛️ `الواجهة: ثيم التوزيع التفاعلي v4.4`\n\n🤖 _اضغط على سحب حساب بالأسفل لتفقد الخيارات المتاحة لك..._"
+            welcome_text = f"🌌 **WELCOME TO THE CYBERPUNK DISTRIBUTOR CORE** 🌌\n\n⚡ `الحالة: متصل بالشبكة الآمنة`\n🎛️ `الواجهة: ثيم التوزيع التفاعلي v4.5`\n\n🤖 _اضغط على سحب حساب بالأسفل لتفقد الخيارات المتاحة لك..._"
             await httpx.AsyncClient(verify=False).post(f"{telegram_url}/sendMessage", json={"chat_id": chat_id, "text": welcome_text, "reply_markup": get_main_keyboard(is_admin), "parse_mode": "Markdown"})
                 
         elif user_text == "📡 🌐 إحصائيات المخزن 🌐 📡" or user_text == "/stats":
@@ -223,20 +223,40 @@ async def telegram_webhook(request: Request):
             if not OPENBULLET_URL or not OPENBULLET_API_KEY:
                 reply_text = "❌ **خطأ:** متغيرات البيئة غير مكتملة الإعداد."
             else:
-                # تعديل المسار وبنائه برمجياً ليتوافق مع هيكلية خادم OpenBullet المباشرة 
+                # معالجة وحل مشكلة الـ 404 نهائياً لبنية خوادم Hugging Face الـ API المباشرة
                 base_url = OPENBULLET_URL.strip().rstrip("/")
-                ob_api_url = f"{base_url}/api/v1/jobs"
+                if not base_url.endswith("/api/v1") and not base_url.endswith("/api/v1/"):
+                    ob_api_url = f"{base_url}/api/v1/jobs"
+                else:
+                    ob_api_url = f"{base_url}/jobs"
                 
-                headers = {"Authorization": f"Bearer {OPENBULLET_API_KEY.strip()}"}
+                headers = {
+                    "Authorization": f"Bearer {OPENBULLET_API_KEY.strip()}",
+                    "Accept": "application/json"
+                }
                 if HF_TOKEN: 
                     headers["X-Hf-Token"] = HF_TOKEN.strip()
 
                 try:
-                    async with httpx.AsyncClient(verify=False, timeout=10.0) as client:
+                    async with httpx.AsyncClient(verify=False, timeout=12.0) as client:
                         response = await client.get(ob_api_url, headers=headers)
+                    
+                    # إذا أعاد 404، نقوم بتجربة المسار البديل المباشر للحاوية
+                    if response.status_code == 404:
+                        alt_url = f"{base_url}/jobs" if "/api/v1" in base_url else f"{base_url}/api/jobs"
+                        response = await client.get(alt_url, headers=headers)
+
                     if response.status_code == 200:
                         jobs_data = response.json()
-                        running_jobs = [j for j in jobs_data if isinstance(j, dict) and j.get("status") in ["Running", "Active"]]
+                        # دعم معالجة البيانات سواء كانت قائمة مباشرة أو قاموساً يحوي المصفوفة
+                        if isinstance(jobs_data, dict) and "items" in jobs_data:
+                            jobs_list = jobs_data["items"]
+                        elif isinstance(jobs_data, list):
+                            jobs_list = jobs_data
+                        else:
+                            jobs_list = []
+
+                        running_jobs = [j for j in jobs_list if isinstance(j, dict) and j.get("status") in ["Running", "Active"]]
                         if not running_jobs:
                             reply_text = "💤 **حالة الـ Mainframe:** `خامل (IDLE)`\n\n🟢 لا توجد عمليات فحص نشطة حالياً على الخادم."
                         else:
@@ -244,9 +264,9 @@ async def telegram_webhook(request: Request):
                             for job in running_jobs:
                                 reply_text += f"📦 **العملية:** `{job.get('name')}`\n📊 **التقدم:** `{job.get('progress', 0):.1f}%`\n⚡ **السرعة (CPM):** `{job.get('cpm', 0)}`\n🎯 **الـ Hits المحصودة:** `{job.get('hits', 0)}`\n────────────────────\n"
                     else:
-                        reply_text = f"❌ **خطأ الخادم ({response.status_code}):** تعذر جلب البيانات. تأكد من إعداد رابط الـ Space بشكل صحيح بدون مسارات إضافية في المتغيرات البيئية."
+                        reply_text = f"❌ **خطأ الخادم ({response.status_code}):** تعذر جلب البيانات. يرجى التحقق من متغير الرابط `OPENBULLET_URL` في منصة الـ Hosting."
                 except Exception as ex:
-                    reply_text = f"🚨 **خطأ بالاتصال:** `تفاصيل: {str(ex)}`"
+                    reply_text = f"🚨 **خطأ بالاتصال بالـ Space:** `تفاصيل: {str(ex)}`"
             await httpx.AsyncClient(verify=False).post(f"{telegram_url}/sendMessage", json={"chat_id": chat_id, "text": reply_text, "parse_mode": "Markdown"})
 
         elif user_text == "🛠️ 👾 لوحة تحكم المطور 👾 🛠️" and is_admin:
