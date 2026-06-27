@@ -183,7 +183,7 @@ async def telegram_webhook(request: Request):
         is_admin = chat_id in ADMIN_IDS
         
         if user_text == "/start":
-            welcome_text = f"🌌 **WELCOME TO THE CYBERPUNK DISTRIBUTOR CORE** 🌌\n\n⚡ `الحالة: متصل بالشبكة الآمنة`\n🎛️ `الواجهة: ثيم التوزيع التفاعلي v4.7`\n\n🤖 _اضغط على سحب حساب بالأسفل لتفقد الخيارات المتاحة لك..._"
+            welcome_text = f"🌌 **WELCOME TO THE CYBERPUNK DISTRIBUTOR CORE** 🌌\n\n⚡ `الحالة: متصل بالشبكة الآمنة`\n🎛️ `الواجهة: ثيم التوزيع التفاعلي v4.8`\n\n🤖 _اضغط على سحب حساب بالأسفل لتفقد الخيارات المتاحة لك..._"
             async with httpx.AsyncClient(verify=False) as client:
                 await client.post(f"{telegram_url}/sendMessage", json={"chat_id": chat_id, "text": welcome_text, "reply_markup": get_main_keyboard(is_admin), "parse_mode": "Markdown"})
                 
@@ -235,10 +235,16 @@ async def telegram_webhook(request: Request):
                 }
 
                 try:
-                    async with httpx.AsyncClient(verify=False, timeout=10.0) as client:
+                    async with httpx.AsyncClient(verify=False, timeout=12.0) as client:
                         response = await client.get(ob_api_url, headers=headers)
+                        
+                        # معالجة ذكية: إذا أرجع مسار v1 خطأ 404 أو نصاً، نجرب المسار المباشر الآخر
+                        if response.status_code != 200 or "application/json" not in response.headers.get("content-type", ""):
+                            alt_url = f"{base_url}/api/jobs"
+                            response = await client.get(alt_url, headers=headers)
 
-                    if response.status_code == 200:
+                    # التحقق من أن الاستجابة هي بالفعل JSON وليست نصاً عادياً لتجنب خطأ Char 0
+                    if response.status_code == 200 and "application/json" in response.headers.get("content-type", ""):
                         jobs_data = response.json()
                         jobs_list = jobs_data["items"] if isinstance(jobs_data, dict) and "items" in jobs_data else (jobs_data if isinstance(jobs_data, list) else [])
 
@@ -250,7 +256,9 @@ async def telegram_webhook(request: Request):
                             for job in running_jobs:
                                 reply_text += f"📦 **العملية:** `{job.get('name')}`\n📊 **التقدم:** `{job.get('progress', 0):.1f}%`\n⚡ **السرعة (CPM):** `{job.get('cpm', 0)}`\n🎯 **الـ Hits المحصودة:** `{job.get('hits', 0)}`\n────────────────────\n"
                     else:
-                        reply_text = f"❌ **خطأ الخادم ({response.status_code}):** تعذر جلب البيانات. تأكد من صحة رابط الـ Public Space والـ API Key الخاص بك."
+                        # في حال أرجع الخادم نصاً عادياً، نعرض أول 150 حرفاً لمعرفة السبب بدقة دون انهيار الكود
+                        preview = response.text[:150] if response.text else "استجابة فارغة"
+                        reply_text = f"⚠️ **تنبيه الاستجابة:** الخادم لم يرسل مصفوفة JSON متوافقة.\n`تفاصيل الرد: {preview}`\n\n💡 تأكد من تفعيل خيار **Admin API Key** وحفظ الإعدادات داخل لوحة OpenBullet."
                 except Exception as ex:
                     reply_text = f"🚨 **خطأ في الاتصال المباشر:** `تفاصيل: {str(ex)}`"
             
