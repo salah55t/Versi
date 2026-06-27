@@ -223,47 +223,94 @@ async def telegram_webhook(request: Request):
                         await client.post(f"{telegram_url}/sendMessage", json={"chat_id": chat_id, "text": choice_text, "reply_markup": {"inline_keyboard": inline_buttons}, "parse_mode": "Markdown"})
 
         elif user_text == "🤖 ⚔️ عمليات أوبن بلوت الجارية ⚔️ 🤖":
-            if not OPENBULLET_URL or not OPENBULLET_API_KEY:
-                reply_text = "❌ **خطأ:** متغيرات البيئة غير مكتملة الإعداد."
-            else:
-                base_url = OPENBULLET_URL.strip().rstrip("/")
-                ob_api_url = f"{base_url}/api/v1/jobs"
-                
-                headers = {
-                    "Authorization": f"Bearer {OPENBULLET_API_KEY.strip()}",
-                    "Accept": "application/json"
+
+    if not OPENBULLET_URL:
+        reply_text = "❌ OPENBULLET_URL غير موجود."
+    else:
+        try:
+            base_url = OPENBULLET_URL.strip().rstrip("/")
+
+            urls_to_test = [
+                f"{base_url}/api/v1/job/all",
+                f"{base_url}/api/v1/job/multi-run",
+                f"{base_url}/api/v1/job/proxy-check"
+            ]
+
+            headers_variants = [
+                {
+                    "name": "Bearer",
+                    "headers": {
+                        "Authorization": f"Bearer {OPENBULLET_API_KEY}",
+                        "Accept": "application/json"
+                    }
+                },
+                {
+                    "name": "X-Api-Key",
+                    "headers": {
+                        "X-Api-Key": OPENBULLET_API_KEY,
+                        "Accept": "application/json"
+                    }
+                },
+                {
+                    "name": "Api-Key",
+                    "headers": {
+                        "Api-Key": OPENBULLET_API_KEY,
+                        "Accept": "application/json"
+                    }
                 }
+            ]
 
-                try:
-                    async with httpx.AsyncClient(verify=False, timeout=12.0) as client:
-                        response = await client.get(ob_api_url, headers=headers)
-                        
-                        # معالجة ذكية: إذا أرجع مسار v1 خطأ 404 أو نصاً، نجرب المسار المباشر الآخر
-                        if response.status_code != 200 or "application/json" not in response.headers.get("content-type", ""):
-                            alt_url = f"{base_url}/api/jobs"
-                            response = await client.get(alt_url, headers=headers)
+            report = "🔍 تشخيص OpenBullet API\n\n"
 
-                    # التحقق من أن الاستجابة هي بالفعل JSON وليست نصاً عادياً لتجنب خطأ Char 0
-                    if response.status_code == 200 and "application/json" in response.headers.get("content-type", ""):
-                        jobs_data = response.json()
-                        jobs_list = jobs_data["items"] if isinstance(jobs_data, dict) and "items" in jobs_data else (jobs_data if isinstance(jobs_data, list) else [])
+            async with httpx.AsyncClient(
+                verify=False,
+                timeout=15.0
+            ) as client:
 
-                        running_jobs = [j for j in jobs_list if isinstance(j, dict) and j.get("status") in ["Running", "Active"]]
-                        if not running_jobs:
-                            reply_text = "💤 **حالة الـ Mainframe:** `خامل (IDLE)`\n\n🟢 لا توجد عمليات فحص نشطة حالياً على الخادم."
-                        else:
-                            reply_text = f"⚙️ **「 شاشة مراقبة OPENBULLET 」** ⚙️\n\n⚡ **العمليات النشطة:** `{len(running_jobs)}` عملية فحص جارية\n────────────────────\n"
-                            for job in running_jobs:
-                                reply_text += f"📦 **العملية:** `{job.get('name')}`\n📊 **التقدم:** `{job.get('progress', 0):.1f}%`\n⚡ **السرعة (CPM):** `{job.get('cpm', 0)}`\n🎯 **الـ Hits المحصودة:** `{job.get('hits', 0)}`\n────────────────────\n"
-                    else:
-                        # في حال أرجع الخادم نصاً عادياً، نعرض أول 150 حرفاً لمعرفة السبب بدقة دون انهيار الكود
-                        preview = response.text[:150] if response.text else "استجابة فارغة"
-                        reply_text = f"⚠️ **تنبيه الاستجابة:** الخادم لم يرسل مصفوفة JSON متوافقة.\n`تفاصيل الرد: {preview}`\n\n💡 تأكد من تفعيل خيار **Admin API Key** وحفظ الإعدادات داخل لوحة OpenBullet."
-                except Exception as ex:
-                    reply_text = f"🚨 **خطأ في الاتصال المباشر:** `تفاصيل: {str(ex)}`"
-            
-            async with httpx.AsyncClient(verify=False) as client:
-                await client.post(f"{telegram_url}/sendMessage", json={"chat_id": chat_id, "text": reply_text, "parse_mode": "Markdown"})
+                for auth in headers_variants:
+
+                    report += f"\n====================\n"
+                    report += f"AUTH: {auth['name']}\n"
+                    report += f"====================\n\n"
+
+                    for url in urls_to_test:
+
+                        try:
+                            response = await client.get(
+                                url,
+                                headers=auth["headers"]
+                            )
+
+                            preview = response.text[:300]
+
+                            report += (
+                                f"URL:\n{url}\n\n"
+                                f"STATUS: {response.status_code}\n"
+                                f"CONTENT-TYPE: "
+                                f"{response.headers.get('content-type','unknown')}\n\n"
+                                f"BODY:\n{preview}\n\n"
+                                f"------------------------\n\n"
+                            )
+
+                        except Exception as e:
+                            report += (
+                                f"URL:\n{url}\n\n"
+                                f"ERROR:\n{str(e)}\n\n"
+                            )
+
+            reply_text = report[:4000]
+
+        except Exception as ex:
+            reply_text = f"🚨 Exception:\n{str(ex)}"
+
+    async with httpx.AsyncClient(verify=False) as client:
+        await client.post(
+            f"{telegram_url}/sendMessage",
+            json={
+                "chat_id": chat_id,
+                "text": reply_text
+            }
+        )
 
         elif user_text == "🛠️ 👾 لوحة تحكم المطور 👾 🛠️" and is_admin:
             total_accounts = db.query(Account).count()
