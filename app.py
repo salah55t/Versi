@@ -80,7 +80,6 @@ async def receive_hit(request: Request):
     try:
         data = await request.json()
         
-        # استخراج ذكي لاسم الكونفيج لمنع ظهور الحقول فارغة في التليجرام
         config_name = "UNKNOWN"
         if data.get("config"): config_name = data.get("config")
         elif data.get("configName"): config_name = data.get("configName")
@@ -185,27 +184,31 @@ async def telegram_webhook(request: Request):
         is_admin = chat_id in ADMIN_IDS
         
         if user_text == "/start":
-            welcome_text = f"🌌 **WELCOME TO THE CYBERPUNK DISTRIBUTOR CORE** 🌌\n\n⚡ `الحالة: متصل بالشبكة الآمنة`\n🎛️ `الواجهة: ثيم التوزيع التفاعلي v4.5`\n\n🤖 _اضغط على سحب حساب بالأسفل لتفقد الخيارات المتاحة لك..._"
-            await httpx.AsyncClient(verify=False).post(f"{telegram_url}/sendMessage", json={"chat_id": chat_id, "text": welcome_text, "reply_markup": get_main_keyboard(is_admin), "parse_mode": "Markdown"})
+            welcome_text = f"🌌 **WELCOME TO THE CYBERPUNK DISTRIBUTOR CORE** 🌌\n\n⚡ `الحالة: متصل بالشبكة الآمنة`\n🎛️ `الواجهة: ثيم التوزيع التفاعلي v4.6`\n\n🤖 _اضغط على سحب حساب بالأسفل لتفقد الخيارات المتاحة لك..._"
+            async with httpx.AsyncClient(verify=False) as client:
+                await client.post(f"{telegram_url}/sendMessage", json={"chat_id": chat_id, "text": welcome_text, "reply_markup": get_main_keyboard(is_admin), "parse_mode": "Markdown"})
                 
         elif user_text == "📡 🌐 إحصائيات المخزن 🌐 📡" or user_text == "/stats":
             available_count = db.query(Account).filter(Account.is_given == False).count()
             reply_text = f"┌─── 📡 **「 مستودع البيانات 」** 📡\n│\n└── 🟢 **المتوفر الإجمالي:** `{available_count}` حساب\n│\n└───────────── [ مصفوفة حية ] ⚡"
-            await httpx.AsyncClient(verify=False).post(f"{telegram_url}/sendMessage", json={"chat_id": chat_id, "text": reply_text, "parse_mode": "Markdown"})
+            async with httpx.AsyncClient(verify=False) as client:
+                await client.post(f"{telegram_url}/sendMessage", json={"chat_id": chat_id, "text": reply_text, "parse_mode": "Markdown"})
                 
         elif user_text == "⚡ 🧬 سحب حساب جديد 🧬 ⚡" or user_text == "/get":
             already_received = db.query(DeliveredAccount).filter(DeliveredAccount.user_id == chat_id).first()
             
             if already_received:
                 reply_text = "🚨 **SYSTEM DENIAL:** `جدار الحماية نشط` 🚨\n\n❌ عذراً! يسمح النظام بـ **حساب واحد فقط لكل مستخدم** لضمان العدالة."
-                await httpx.AsyncClient(verify=False).post(f"{telegram_url}/sendMessage", json={"chat_id": chat_id, "text": reply_text, "parse_mode": "Markdown"})
+                async with httpx.AsyncClient(verify=False) as client:
+                    await client.post(f"{telegram_url}/sendMessage", json={"chat_id": chat_id, "text": reply_text, "parse_mode": "Markdown"})
             else:
                 results = db.query(Account.config_name, func.count(Account.id)).filter(Account.is_given == False).group_by(Account.config_name).all()
                 results = [(cfg, cnt) for cfg, cnt in results if cfg]
 
                 if not results:
                     reply_text = "🚨 **MAINFRAME ERROR:** `المستودع فارغ حالياً` 🚨\n\n😔 لا توجد حسابات جديدة جاهزة للتسليم بالمخزن."
-                    await httpx.AsyncClient(verify=False).post(f"{telegram_url}/sendMessage", json={"chat_id": chat_id, "text": reply_text, "parse_mode": "Markdown"})
+                    async with httpx.AsyncClient(verify=False) as client:
+                        await client.post(f"{telegram_url}/sendMessage", json={"chat_id": chat_id, "text": reply_text, "parse_mode": "Markdown"})
                 else:
                     inline_buttons = []
                     for config_name, count in results:
@@ -217,18 +220,15 @@ async def telegram_webhook(request: Request):
                         f"├── ⚡ تم فحص قاعدة البيانات وتجميع الأنواع المتوفرة.\n"
                         f"└── 👇 **اختر نوع الحساب الذي ترغب بسحبه الآن:**"
                     )
-                    await httpx.AsyncClient(verify=False).post(f"{telegram_url}/sendMessage", json={"chat_id": chat_id, "text": choice_text, "reply_markup": {"inline_keyboard": inline_buttons}, "parse_mode": "Markdown"})
+                    async with httpx.AsyncClient(verify=False) as client:
+                        await client.post(f"{telegram_url}/sendMessage", json={"chat_id": chat_id, "text": choice_text, "reply_markup": {"inline_keyboard": inline_buttons}, "parse_mode": "Markdown"})
 
         elif user_text == "🤖 ⚔️ عمليات أوبن بلوت الجارية ⚔️ 🤖":
             if not OPENBULLET_URL or not OPENBULLET_API_KEY:
                 reply_text = "❌ **خطأ:** متغيرات البيئة غير مكتملة الإعداد."
             else:
-                # معالجة وحل مشكلة الـ 404 نهائياً لبنية خوادم Hugging Face الـ API المباشرة
                 base_url = OPENBULLET_URL.strip().rstrip("/")
-                if not base_url.endswith("/api/v1") and not base_url.endswith("/api/v1/"):
-                    ob_api_url = f"{base_url}/api/v1/jobs"
-                else:
-                    ob_api_url = f"{base_url}/jobs"
+                ob_api_url = f"{base_url}/api/v1/jobs"
                 
                 headers = {
                     "Authorization": f"Bearer {OPENBULLET_API_KEY.strip()}",
@@ -238,23 +238,17 @@ async def telegram_webhook(request: Request):
                     headers["X-Hf-Token"] = HF_TOKEN.strip()
 
                 try:
-                    async with httpx.AsyncClient(verify=False, timeout=12.0) as client:
+                    # استخدام عميل معزول ومغلق تلقائياً لمنع خطأ الـ closed client نهائياً
+                    async with httpx.AsyncClient(verify=False, timeout=15.0) as client:
                         response = await client.get(ob_api_url, headers=headers)
-                    
-                    # إذا أعاد 404، نقوم بتجربة المسار البديل المباشر للحاوية
-                    if response.status_code == 404:
-                        alt_url = f"{base_url}/jobs" if "/api/v1" in base_url else f"{base_url}/api/jobs"
-                        response = await client.get(alt_url, headers=headers)
+                        
+                        if response.status_code == 404:
+                            alt_url = f"{base_url}/jobs"
+                            response = await client.get(alt_url, headers=headers)
 
                     if response.status_code == 200:
                         jobs_data = response.json()
-                        # دعم معالجة البيانات سواء كانت قائمة مباشرة أو قاموساً يحوي المصفوفة
-                        if isinstance(jobs_data, dict) and "items" in jobs_data:
-                            jobs_list = jobs_data["items"]
-                        elif isinstance(jobs_data, list):
-                            jobs_list = jobs_data
-                        else:
-                            jobs_list = []
+                        jobs_list = jobs_data["items"] if isinstance(jobs_data, dict) and "items" in jobs_data else (jobs_data if isinstance(jobs_data, list) else [])
 
                         running_jobs = [j for j in jobs_list if isinstance(j, dict) and j.get("status") in ["Running", "Active"]]
                         if not running_jobs:
@@ -264,17 +258,20 @@ async def telegram_webhook(request: Request):
                             for job in running_jobs:
                                 reply_text += f"📦 **العملية:** `{job.get('name')}`\n📊 **التقدم:** `{job.get('progress', 0):.1f}%`\n⚡ **السرعة (CPM):** `{job.get('cpm', 0)}`\n🎯 **الـ Hits المحصودة:** `{job.get('hits', 0)}`\n────────────────────\n"
                     else:
-                        reply_text = f"❌ **خطأ الخادم ({response.status_code}):** تعذر جلب البيانات. يرجى التحقق من متغير الرابط `OPENBULLET_URL` في منصة الـ Hosting."
+                        reply_text = f"❌ **خطأ الخادم ({response.status_code}):** تعذر الاتصال بالـ API الداخلي للـ Space."
                 except Exception as ex:
                     reply_text = f"🚨 **خطأ بالاتصال بالـ Space:** `تفاصيل: {str(ex)}`"
-            await httpx.AsyncClient(verify=False).post(f"{telegram_url}/sendMessage", json={"chat_id": chat_id, "text": reply_text, "parse_mode": "Markdown"})
+            
+            async with httpx.AsyncClient(verify=False) as client:
+                await client.post(f"{telegram_url}/sendMessage", json={"chat_id": chat_id, "text": reply_text, "parse_mode": "Markdown"})
 
         elif user_text == "🛠️ 👾 لوحة تحكم المطور 👾 🛠️" and is_admin:
             total_accounts = db.query(Account).count()
             available_count = db.query(Account).filter(Account.is_given == False).count()
             delivered_count = db.query(Account).filter(Account.is_given == True).count()
             admin_text = f"┌─── 🌌 **「 لوحة تحكم النيون المتقدمة 」** 🌌\n│\n├── 🟣 **إجمالي الحسابات:** `{total_accounts}`\n├── 🟢 **الحسابات الجاهزة:** `{available_count}`\n└── 🔴 **الحسابات الموزعة:** `{delivered_count}`\n│\n└────────────── [ أوامر النظام التفاعلية ] 👇"
-            await httpx.AsyncClient(verify=False).post(f"{telegram_url}/sendMessage", json={"chat_id": chat_id, "text": admin_text, "reply_markup": get_inline_control_buttons(), "parse_mode": "Markdown"})
+            async with httpx.AsyncClient(verify=False) as client:
+                await client.post(f"{telegram_url}/sendMessage", json={"chat_id": chat_id, "text": admin_text, "reply_markup": get_inline_control_buttons(), "parse_mode": "Markdown"})
 
         return {"status": "success"}
     except Exception as e:
