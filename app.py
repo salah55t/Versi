@@ -11,7 +11,7 @@ app = FastAPI()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 
 # معرفات المسؤولين: ضع الـ Chat ID الخاص بك هنا لتظهر لك لوحة التحكم السرية للأدمن
-ADMIN_IDS = ["123456789"] 
+ADMIN_IDS = ["6624995237"] 
 
 # جلب رابط قاعدة بيانات ريندر وتعديله ليتوافق مع SQLAlchemy الجديد
 DATABASE_URL = os.getenv("DATABASE_URL")
