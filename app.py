@@ -80,15 +80,14 @@ async def receive_hit(request: Request):
     try:
         data = await request.json()
         
-        # قراءة ذكية شاملة لاستخراج اسم الكونفيج من OpenBullet لمنع ظهور الاسم فارغاً
+        # استخراج ذكي لاسم الكونفيج لمنع ظهور الحقول فارغة في التليجرام
         config_name = "UNKNOWN"
         if data.get("config"): config_name = data.get("config")
         elif data.get("configName"): config_name = data.get("configName")
         elif data.get("ConfigName"): config_name = data.get("ConfigName")
-        elif data.get("variables") and "Config.Name" in str(data.get("variables")):
-            # محاولة الاستخراج من المتغيرات المحصودة إذا أرسلها أوبن بلوت بالداخل
+        elif data.get("variables"):
             for var in data.get("variables", []):
-                if var.get("name") in ["Config.Name", "config", "Config"]:
+                if isinstance(var, dict) and var.get("name") in ["Config.Name", "config", "Config"]:
                     config_name = var.get("value")
                     break
 
@@ -186,7 +185,7 @@ async def telegram_webhook(request: Request):
         is_admin = chat_id in ADMIN_IDS
         
         if user_text == "/start":
-            welcome_text = f"🌌 **WELCOME TO THE CYBERPUNK DISTRIBUTOR CORE** 🌌\n\n⚡ `الحالة: متصل بالشبكة الآمنة`\n🎛️ `الواجهة: ثيم التوزيع التفاعلي v4.3`\n\n🤖 _اضغط على سحب حساب بالأسفل لتفقد الخيارات المتاحة لك..._"
+            welcome_text = f"🌌 **WELCOME TO THE CYBERPUNK DISTRIBUTOR CORE** 🌌\n\n⚡ `الحالة: متصل بالشبكة الآمنة`\n🎛️ `الواجهة: ثيم التوزيع التفاعلي v4.4`\n\n🤖 _اضغط على سحب حساب بالأسفل لتفقد الخيارات المتاحة لك..._"
             await httpx.AsyncClient(verify=False).post(f"{telegram_url}/sendMessage", json={"chat_id": chat_id, "text": welcome_text, "reply_markup": get_main_keyboard(is_admin), "parse_mode": "Markdown"})
                 
         elif user_text == "📡 🌐 إحصائيات المخزن 🌐 📡" or user_text == "/stats":
@@ -224,27 +223,28 @@ async def telegram_webhook(request: Request):
             if not OPENBULLET_URL or not OPENBULLET_API_KEY:
                 reply_text = "❌ **خطأ:** متغيرات البيئة غير مكتملة الإعداد."
             else:
-                # تصحيح مسار الـ API الموجه لنسخ الـ OpenBullet 2 لحل خطأ الـ 404 نهائياً
+                # تعديل المسار وبنائه برمجياً ليتوافق مع هيكلية خادم OpenBullet المباشرة 
                 base_url = OPENBULLET_URL.strip().rstrip("/")
                 ob_api_url = f"{base_url}/api/v1/jobs"
                 
-                headers = {"Authorization": f"Bearer {OPENBULLET_API_KEY}"}
-                if HF_TOKEN: headers["X-Hf-Token"] = HF_TOKEN.strip()
+                headers = {"Authorization": f"Bearer {OPENBULLET_API_KEY.strip()}"}
+                if HF_TOKEN: 
+                    headers["X-Hf-Token"] = HF_TOKEN.strip()
 
                 try:
-                    async with httpx.AsyncClient(verify=False, timeout=8.0) as client:
+                    async with httpx.AsyncClient(verify=False, timeout=10.0) as client:
                         response = await client.get(ob_api_url, headers=headers)
                     if response.status_code == 200:
                         jobs_data = response.json()
-                        running_jobs = [j for j in jobs_data if j.get("status") in ["Running", "Active"]]
+                        running_jobs = [j for j in jobs_data if isinstance(j, dict) and j.get("status") in ["Running", "Active"]]
                         if not running_jobs:
-                            reply_text = "💤 **حالة الـ Mainframe:** `خامل (IDLE)`\n\n🟢 لا توجد عمليات فحص نشطة حالياً."
+                            reply_text = "💤 **حالة الـ Mainframe:** `خامل (IDLE)`\n\n🟢 لا توجد عمليات فحص نشطة حالياً على الخادم."
                         else:
                             reply_text = f"⚙️ **「 شاشة مراقبة OPENBULLET 」** ⚙️\n\n⚡ **العمليات النشطة:** `{len(running_jobs)}` عملية فحص جارية\n────────────────────\n"
                             for job in running_jobs:
                                 reply_text += f"📦 **العملية:** `{job.get('name')}`\n📊 **التقدم:** `{job.get('progress', 0):.1f}%`\n⚡ **السرعة (CPM):** `{job.get('cpm', 0)}`\n🎯 **الـ Hits المحصودة:** `{job.get('hits', 0)}`\n────────────────────\n"
                     else:
-                        reply_text = f"❌ **خطأ الخادم ({response.status_code}):** تأكد من تفعيل وصحة الـ Admin API Key في إعدادات أوبن بلوت."
+                        reply_text = f"❌ **خطأ الخادم ({response.status_code}):** تعذر جلب البيانات. تأكد من إعداد رابط الـ Space بشكل صحيح بدون مسارات إضافية في المتغيرات البيئية."
                 except Exception as ex:
                     reply_text = f"🚨 **خطأ بالاتصال:** `تفاصيل: {str(ex)}`"
             await httpx.AsyncClient(verify=False).post(f"{telegram_url}/sendMessage", json={"chat_id": chat_id, "text": reply_text, "parse_mode": "Markdown"})
