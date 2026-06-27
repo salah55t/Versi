@@ -9,7 +9,7 @@ app = FastAPI()
 
 # ==================== CONFIGURATION ====================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-ADMIN_IDS = ["6624995237"]  # ⚠️ ضع الـ Chat ID الخاص بك هنا
+ADMIN_IDS = ["123456789"]  # ⚠️ ضع الـ Chat ID الخاص بك هنا
 
 OPENBULLET_URL = os.getenv("OPENBULLET_URL")        
 OPENBULLET_API_KEY = os.getenv("OPENBULLET_API_KEY")  
@@ -166,7 +166,7 @@ async def telegram_webhook(request: Request):
                 elif data == "clear_accounts":
                     db.query(Account).delete()
                     db.commit()
-                    await client.post(f"{telegram_url}/answerCallbackQuery", json={"callback_query_id": callback_id, "text": "🚨 تم مسح المخزن تماماً.", "show_alert": True})
+                    await client.post(f"{timestamp_url}/answerCallbackQuery", json={"callback_query_id": callback_id, "text": "🚨 تم مسح المخزن تماماً.", "show_alert": True})
                 elif data == "refresh_admin_stats":
                     total_accounts = db.query(Account).count()
                     available_count = db.query(Account).filter(Account.is_given == False).count()
@@ -184,7 +184,7 @@ async def telegram_webhook(request: Request):
         is_admin = chat_id in ADMIN_IDS
         
         if user_text == "/start":
-            welcome_text = f"🌌 **WELCOME TO THE CYBERPUNK DISTRIBUTOR CORE** 🌌\n\n⚡ `الحالة: متصل بالشبكة الآمنة`\n🎛️ `الواجهة: ثيم التوزيع التفاعلي v4.6`\n\n🤖 _اضغط على سحب حساب بالأسفل لتفقد الخيارات المتاحة لك..._"
+            welcome_text = f"🌌 **WELCOME TO THE CYBERPUNK DISTRIBUTOR CORE** 🌌\n\n⚡ `الحالة: متصل بالشبكة الآمنة`\n🎛️ `الواجهة: ثيم التوزيع التفاعلي v4.7`\n\n🤖 _اضغط على سحب حساب بالأسفل لتفقد الخيارات المتاحة لك..._"
             async with httpx.AsyncClient(verify=False) as client:
                 await client.post(f"{telegram_url}/sendMessage", json={"chat_id": chat_id, "text": welcome_text, "reply_markup": get_main_keyboard(is_admin), "parse_mode": "Markdown"})
                 
@@ -228,39 +228,52 @@ async def telegram_webhook(request: Request):
                 reply_text = "❌ **خطأ:** متغيرات البيئة غير مكتملة الإعداد."
             else:
                 base_url = OPENBULLET_URL.strip().rstrip("/")
-                ob_api_url = f"{base_url}/api/v1/jobs"
                 
+                # إعداد الترويسات مع دعم الـ Token والـ API Key بشكل ترادفي
                 headers = {
                     "Authorization": f"Bearer {OPENBULLET_API_KEY.strip()}",
-                    "Accept": "application/json"
+                    "X-Api-Key": OPENBULLET_API_KEY.strip(),
+                    "Accept": "application/json, text/plain, */*"
                 }
                 if HF_TOKEN: 
                     headers["X-Hf-Token"] = HF_TOKEN.strip()
 
-                try:
-                    # استخدام عميل معزول ومغلق تلقائياً لمنع خطأ الـ closed client نهائياً
-                    async with httpx.AsyncClient(verify=False, timeout=15.0) as client:
-                        response = await client.get(ob_api_url, headers=headers)
-                        
-                        if response.status_code == 404:
-                            alt_url = f"{base_url}/jobs"
-                            response = await client.get(alt_url, headers=headers)
+                # مصفوفة المسارات البديلة لتخطي جدار الحماية (Reverse Proxy) بنجاح
+                possible_endpoints = [
+                    f"{base_url}/api/v1/jobs",
+                    f"{base_url}/jobs",
+                    f"{base_url}/api/jobs",
+                    f"https://hammzz-myopenbullet.hf.space/api/v1/jobs" # ربط ثابت مباشر كملجأ أخير
+                ]
+                
+                jobs_list = None
+                response_status = 404
+                
+                async with httpx.AsyncClient(verify=False, timeout=10.0) as client:
+                    for url in possible_endpoints:
+                        try:
+                            response = await client.get(url, headers=headers)
+                            response_status = response.status_code
+                            if response.status_code == 200:
+                                jobs_data = response.json()
+                                if isinstance(jobs_data, dict) and "items" in jobs_data:
+                                    jobs_list = jobs_data["items"]
+                                elif isinstance(jobs_data, list):
+                                    jobs_list = jobs_data
+                                break
+                        except Exception:
+                            continue
 
-                    if response.status_code == 200:
-                        jobs_data = response.json()
-                        jobs_list = jobs_data["items"] if isinstance(jobs_data, dict) and "items" in jobs_data else (jobs_data if isinstance(jobs_data, list) else [])
-
-                        running_jobs = [j for j in jobs_list if isinstance(j, dict) and j.get("status") in ["Running", "Active"]]
-                        if not running_jobs:
-                            reply_text = "💤 **حالة الـ Mainframe:** `خامل (IDLE)`\n\n🟢 لا توجد عمليات فحص نشطة حالياً على الخادم."
-                        else:
-                            reply_text = f"⚙️ **「 شاشة مراقبة OPENBULLET 」** ⚙️\n\n⚡ **العمليات النشطة:** `{len(running_jobs)}` عملية فحص جارية\n────────────────────\n"
-                            for job in running_jobs:
-                                reply_text += f"📦 **العملية:** `{job.get('name')}`\n📊 **التقدم:** `{job.get('progress', 0):.1f}%`\n⚡ **السرعة (CPM):** `{job.get('cpm', 0)}`\n🎯 **الـ Hits المحصودة:** `{job.get('hits', 0)}`\n────────────────────\n"
+                if jobs_list is not None:
+                    running_jobs = [j for j in jobs_list if isinstance(j, dict) and j.get("status") in ["Running", "Active"]]
+                    if not running_jobs:
+                        reply_text = "💤 **حالة الـ Mainframe:** `خامل (IDLE)`\n\n🟢 لا توجد عمليات فحص نشطة حالياً على الخادم."
                     else:
-                        reply_text = f"❌ **خطأ الخادم ({response.status_code}):** تعذر الاتصال بالـ API الداخلي للـ Space."
-                except Exception as ex:
-                    reply_text = f"🚨 **خطأ بالاتصال بالـ Space:** `تفاصيل: {str(ex)}`"
+                        reply_text = f"⚙️ **「 شاشة مراقبة OPENBULLET 」** ⚙️\n\n⚡ **العمليات النشطة:** `{len(running_jobs)}` عملية فحص جارية\n────────────────────\n"
+                        for job in running_jobs:
+                            reply_text += f"📦 **العملية:** `{job.get('name')}`\n📊 **التقدم:** `{job.get('progress', 0):.1f}%`\n⚡ **السرعة (CPM):** `{job.get('cpm', 0)}`\n🎯 **الـ Hits المحصودة:** `{job.get('hits', 0)}`\n────────────────────\n"
+                else:
+                    reply_text = f"❌ **خطأ الخادم ({response_status}):** تعذر تجاوز جدار حماية الـ Space. يرجى مراجعة إعدادات الـ Admin API Key والتحقق من تشغيل الـ Space بنجاح."
             
             async with httpx.AsyncClient(verify=False) as client:
                 await client.post(f"{telegram_url}/sendMessage", json={"chat_id": chat_id, "text": reply_text, "parse_mode": "Markdown"})
