@@ -7,99 +7,83 @@ from sqlalchemy.orm import sessionmaker
 
 app = FastAPI()
 
-# ==================== إعدادات البيئة والتكوين ====================
+# ==================== CYBERPUNK CONFIG ====================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+ADMIN_IDS = ["6624995237"] # ضع الـ Chat ID الخاص بك هنا
 
-# معرفات المسؤولين: ضع الـ Chat ID الخاص بك هنا لتظهر لك لوحة التحكم السرية للأدمن
-ADMIN_IDS = ["6624995237"] 
-
-# جلب رابط قاعدة بيانات ريندر وتعديله ليتوافق مع SQLAlchemy الجديد
 DATABASE_URL = os.getenv("DATABASE_URL")
 if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
-# ==================== إعدادات قاعدة البيانات (SQLAlchemy) ====================
+# ==================== DATABASE CONFIG ====================
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
-# 1. جدول الحسابات المخزنة القادمة من الـ Hit
 class Account(Base):
     __tablename__ = "accounts"
-    
     id = Column(Integer, primary_key=True, index=True)
     config_name = Column(String, index=True)
-    account_data = Column(String, unique=True, index=True) # unique تمنع تكرار نفس الحساب في القاعدة
+    account_data = Column(String, unique=True, index=True)
     captured_data = Column(String)
-    is_given = Column(Boolean, default=False) # True إذا تم تسليمه لمستخدم
+    is_given = Column(Boolean, default=False)
 
-# 2. جدول المستخدمين الذين استلموا حصتهم (لمنع التكرار)
 class DeliveredAccount(Base):
     __tablename__ = "delivered_accounts"
-    
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(String, unique=True, index=True)
 
-# إنشاء الجداول تلقائياً في قاعدة البيانات عند إقلاع التطبيق على ريندر
 Base.metadata.create_all(bind=engine)
 
+# ==================== CYBER KEYBOARDS ====================
 
-# ==================== الدالات المساعدة لواجهات البوت ====================
-
-# 1. أزرار القائمة الرئيسية الثابتة (أسفل الشاشة)
 def get_main_keyboard(is_admin: bool):
+    # أزرار القائمة الرئيسية بثيم النيون والسيبراني
     buttons = [
-        [{"text": "🎁 طلب حساب جديد"}, {"text": "📊 فحص المتوفر"}]
+        [{"text": "⚡ 🧬 DISPENSE ACCOUNT 🧬 ⚡"}, {"text": "📡 🌐 CORE MATRIX STATS 🌐 📡"}]
     ]
     if is_admin:
-        # إضافة زر لوحة التحكم فقط إذا كان المتصل أدمن
-        buttons.append([{"text": "⚙️ لوحة تحكم المطور"}])
+        buttons.append([{"text": "🛠️ 👾 CYBERNETIC CONTROL PANEL 👾 🛠️"}])
         
     return {
         "keyboard": buttons,
-        "resize_keyboard": True, # لجعل الأزرار متناسقة ومريحة للموبايل
+        "resize_keyboard": True,
         "one_time_keyboard": False
     }
 
-# 2. الأزرار الشفافة التفاعلية (أسفل رسالة الإحصائيات للأدمن)
 def get_inline_control_buttons():
+    # أزرار لوحة التحكم الشفافة المتوهجة
     return {
         "inline_keyboard": [
             [
-                {"text": "🧹 تصفير الموزع", "callback_data": "reset_delivered"},
-                {"text": "🗑️ حذف كل الحسابات", "callback_data": "clear_accounts"}
+                {"text": "🧬 REBOOT DATABASE", "callback_data": "reset_delivered"},
+                {"text": "🚨 PURGE ALL DATA", "callback_data": "clear_accounts"}
             ],
             [
-                {"text": "🔄 تحديث الإحصائيات", "callback_data": "refresh_admin_stats"}
+                {"text": "🔄 REFRESH MAINFRAME", "callback_data": "refresh_admin_stats"}
             ]
         ]
     }
 
-
-# ==================== المسارات (Endpoints) ====================
+# ==================== ENDPOINTS ====================
 
 @app.get("/")
 def read_root():
-    return {"status": "Database & Luxury Bot Bridge is running successfully!"}
+    return {"status": "Cyber Core Matrix is Online & Fully Operational."}
 
-
-# 1. استقبال الـ Hits وتخزينها في قاعدة البيانات
 @app.post("/webhook/hit")
 async def receive_hit(request: Request):
     db = SessionLocal()
     try:
         data = await request.json()
+        config_name = data.get("config") or data.get("configName") or data.get("ConfigName") or "UNKNOWN_MODULE"
+        account_data = data.get("data", "NO_DATA")
+        captured_data = data.get("captured") or data.get("capturedData") or data.get("variables") or "NO_CAPTURED_DATA"
         
-        config_name = data.get("config") or data.get("configName") or data.get("ConfigName") or "Unknown Config"
-        account_data = data.get("data", "No Data")
-        captured_data = data.get("captured") or data.get("capturedData") or data.get("variables") or "No Captured Data"
-        
-        # التأكد من أن الحساب لم يتم صيده وتخزينه مسبقاً من قبل
         exists = db.query(Account).filter(Account.account_data == account_data).first()
         if exists:
-            return {"status": "ignored", "message": "Account already exists in database"}
+            return {"status": "ignored"}
             
-        # حفظ الحساب كـ "غير موزع بعد"
         new_account = Account(
             config_name=config_name,
             account_data=account_data,
@@ -108,18 +92,13 @@ async def receive_hit(request: Request):
         )
         db.add(new_account)
         db.commit()
-        
-        return {"status": "success", "message": "Account secured and stored in Render DB"}
-        
+        return {"status": "success"}
     except Exception as e:
         db.rollback()
-        print(f"Error saving hit: {str(e)}")
         return {"status": "error", "message": str(e)}
     finally:
         db.close()
 
-
-# 2. معالجة عمليات بوت تليجرام بالكامل (استقبال + أزرار + توزيع)
 @app.post("/webhook/telegram")
 async def telegram_webhook(request: Request):
     db = SessionLocal()
@@ -127,50 +106,47 @@ async def telegram_webhook(request: Request):
         payload = await request.json()
         telegram_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
         
-        # --- [أ] معالجة ضغطات الأزرار الشفافة Inline Buttons (Callback Queries) ---
+        # --- [أ] Callback Queries (الأزرار الشفافة لـ لوحة الأدمن) ---
         if "callback_query" in payload:
             callback_id = payload["callback_query"]["id"]
             chat_id = str(payload["callback_query"]["message"]["chat"]["id"])
             message_id = payload["callback_query"]["message"]["message_id"]
             data = payload["callback_query"]["data"]
             
-            # حماية اللوحة: منع غير الأدمن من ضغط الأزرار الخلفية
             if chat_id not in ADMIN_IDS:
                 async with httpx.AsyncClient(verify=False) as client:
-                    await client.post(f"{telegram_url}/answerCallbackQuery", json={"callback_query_id": callback_id, "text": "❌ عذراً، هذا الأمر خاص بالمطور فقط!", "show_alert": True})
+                    await client.post(f"{telegram_url}/answerCallbackQuery", json={"callback_query_id": callback_id, "text": "❌ ACCESS DENIED: SYSTEM BREACH DETECTED.", "show_alert": True})
                 return {"status": "success"}
 
             async with httpx.AsyncClient(verify=False) as client:
-                # أمر تصفير الموزع (السماح للمستخدمين بالطلب مجدداً)
                 if data == "reset_delivered":
                     db.query(DeliveredAccount).delete()
                     db.commit()
-                    await client.post(f"{telegram_url}/answerCallbackQuery", json={"callback_query_id": callback_id, "text": "🧹 تم تصفير سجل التوزيع! يمكن للجميع سحب حساب جديد الآن.", "show_alert": True})
+                    await client.post(f"{telegram_url}/answerCallbackQuery", json={"callback_query_id": callback_id, "text": "🧹 DATABASE FLUSHED: ALL USERS RESTORED TO ACCESS LIST.", "show_alert": True})
                 
-                # أمر حذف كل الحسابات من المخزن
                 elif data == "clear_accounts":
                     db.query(Account).delete()
                     db.commit()
-                    await client.post(f"{telegram_url}/answerCallbackQuery", json={"callback_query_id": callback_id, "text": "🗑️ تم إفراغ قاعدة البيانات وحذف جميع الحسابات.", "show_alert": True})
+                    await client.post(f"{telegram_url}/answerCallbackQuery", json={"callback_query_id": callback_id, "text": "🚨 MAINFRAME PURGED: ALL ACCOUNTS DELETED FROM SECTOR 0.", "show_alert": True})
                 
-                # أمر تحديث إحصائيات اللوحة بشكل مباشر
                 elif data == "refresh_admin_stats":
                     total_accounts = db.query(Account).count()
                     available_count = db.query(Account).filter(Account.is_given == False).count()
                     delivered_count = db.query(Account).filter(Account.is_given == True).count()
                     
                     updated_text = (
-                        f"🛡️ **لوحة تحكم المطور الفاخرة** 🛡️\n\n"
-                        f"📦 إجمالي الحسابات بالسيستم: `{total_accounts}`\n"
-                        f"🟢 الحسابات الجاهزة للتسليم: `{available_count}`\n"
-                        f"🔴 الحسابات التي تم توزيعها: `{delivered_count}`\n\n"
-                        f"✨ التحديث: مباشر وتلقائي"
+                        f"┌─── 🌌 **「 CYBER CORE PANEL 」** 🌌\n"
+                        f"│\n"
+                        f"├── 🟣 **TOTAL ENCRYPTED:** `{total_accounts}`\n"
+                        f"├── 🟢 **READY FOR INJECTION:** `{available_count}`\n"
+                        f"└── 🔴 **DECOY DISTRIBUTED:** `{delivered_count}`\n"
+                        f"│\n"
+                        f"└────────────── [ LIVE MATRIX ] 🖥️"
                     )
                     await client.post(f"{telegram_url}/editMessageText", json={"chat_id": chat_id, "message_id": message_id, "text": updated_text, "reply_markup": get_inline_control_buttons(), "parse_mode": "Markdown"})
-            
             return {"status": "success"}
 
-        # --- [ب] معالجة الرسائل النصية والضغط على الأزرار الثابتة ---
+        # --- [ب] التعامل مع الرسائل والأزرار الثابتة ---
         if "message" not in payload or "text" not in payload["message"]:
             return {"status": "ignored"}
             
@@ -178,9 +154,14 @@ async def telegram_webhook(request: Request):
         user_text = payload["message"]["text"].strip()
         is_admin = chat_id in ADMIN_IDS
         
-        # عند إرسال /start لتفعيل الأزرار الثابتة لأول مرة
+        # أمر البداية السيبراني ترحيبي
         if user_text == "/start":
-            welcome_text = "✨ **مرحباً بك في بوت التوزيع التلقائي الفاخر!**\n\nقم باستخدام الأزرار الظاهرة أسفل الشاشة للتفاعل مع النظام بكل سهولة 👇"
+            welcome_text = (
+                f"🌌 **WELCOME TO THE CYBERPUNK DISTRIBUTOR CORE** 🌌\n\n"
+                f"⚡ `STATUS: CONNECTED`\n"
+                f"🎛️ `INTERFACE: NEON NIGHT v3.0`\n\n"
+                f"🤖 _استخدم لوحة التحكم اللاسلكية بالأسفل لاختراق مصفوفة البيانات وسحب الحسابات المتاحة فوراً..._"
+            )
             payload_data = {
                 "chat_id": chat_id,
                 "text": welcome_text,
@@ -190,63 +171,66 @@ async def telegram_webhook(request: Request):
             async with httpx.AsyncClient(verify=False) as client:
                 await client.post(f"{telegram_url}/sendMessage", json=payload_data)
                 
-        # زر فحص المتوفر في المخزن
-        elif user_text == "📊 فحص المتوفر" or user_text == "/stats":
+        # زر فحص المتوفر السيبراني
+        elif user_text == "📡 🌐 CORE MATRIX STATS 🌐 📡" or user_text == "/stats":
             available_count = db.query(Account).filter(Account.is_given == False).count()
-            reply_text = f"📊 **حالة المخزن الحالي:**\n\n🟢 عدد الحسابات المتاحة للتوزيع فوراً: `{available_count}` حساب."
+            reply_text = (
+                f"┌─── 📡 **「 MATRIX STORAGE 」** 📡\n"
+                f"│\n"
+                f"└── 🟢 **AVAILABLE IN STORAGE:** `{available_count}` ACCOUNTS\n"
+                f"│\n"
+                f"└───────────── [ ONLINE ] ⚡"
+            )
             async with httpx.AsyncClient(verify=False) as client:
                 await client.post(f"{telegram_url}/sendMessage", json={"chat_id": chat_id, "text": reply_text, "parse_mode": "Markdown"})
                 
-        # زر طلب حساب جديد (نظام التوزيع العادل)
-        elif user_text == "🎁 طلب حساب جديد" or user_text == "/get":
-            # التحقق أولاً إن كان المستخدم قد أخذ حساباً مسبقاً
+        # زر سحب حساب جديد بتنسيق نيون مشفر وثيم هكر فاخر
+        elif user_text == "⚡ 🧬 DISPENSE ACCOUNT 🧬 ⚡" or user_text == "/get":
             already_received = db.query(DeliveredAccount).filter(DeliveredAccount.user_id == chat_id).first()
             
             if already_received:
-                reply_text = "❌ **عذراً صديقي!**\n\nلقد استلمت حسابك الخاص سابقاً بنجاح. النظام مصمم ليعطي **حساب واحد فقط لكل شخص** لضمان التوزيع العادل."
+                reply_text = "🚨 **SYSTEM DENIAL:** `FIREWALL ACTIVE` 🚨\n\n❌ لقد قمت بحقن هذا الـ ID مسبقاً! النظام يسمح بـ **حصّة واحدة فقط (1 account per terminal)** لحماية الشبكة من الضغط."
             else:
-                # جلب أول حساب متوفر في الطابور
                 available_account = db.query(Account).filter(Account.is_given == False).first()
                 
                 if not available_account:
-                    reply_text = "😔 **المخزن فارغ حالياً!**\n\nنأسف لك، لا توجد حسابات جاهزة للتسليم في هذه اللحظة. انتظر حتى يتم صيد حسابات جديدة وضخها!"
+                    reply_text = "🚨 **MAINFRAME ERROR:** `STORAGE EMPTY` 🚨\n\n😔 نأسف، لا توجد أي بيانات مشفرة في مخزن المصفوفة حالياً. انتظر ضخ الـ Webhook القادم..."
                 else:
-                    # تحديث حالة الحساب وحظر المستخدم من الأخذ مجدداً
                     available_account.is_given = True
                     user_claim = DeliveredAccount(user_id=chat_id)
                     db.add(user_claim)
                     db.commit()
                     
-                    # صياغة رسالة الحساب بالتنسيق الفاخر (مربعات برمجية قابلة للنسخ بالضغط)
                     reply_text = (
-                        f"🎉 **تم تجهيز حسابك الخاص بنجاح!**\n\n"
-                        f"📂 **النوع / Config:** `{available_account.config_name}`\n"
-                        f"👤 **بيانات الحساب:**\n`{available_account.account_data}`\n\n"
-                        f"⚙️ **البيانات المستخرجة (Captured):**\n`{available_account.captured_data}`\n\n"
-                        f"⚠️ _تنبيه: تم تسجيل الـ ID الخاص بك، لا يمكنك طلب حساب آخر._"
+                        f"🌌 **⚡ 「 DATA INJECTION SUCCESSFUL 」 ⚡** 🌌\n\n"
+                        f"📦 **MODULE (Config):**\n`{available_account.config_name}`\n\n"
+                        f"👤 **TARGET DATA (Account):**\n`{available_account.account_data}`\n\n"
+                        f"⚙️ **DECRYPTED LOGS (Captured):**\n`{available_account.captured_data}`\n\n"
+                        f"🔒 _STATUS: TERMINAL LOCKED - SECURE YOUR CREDENTIALS._"
                     )
                     
             async with httpx.AsyncClient(verify=False) as client:
                 await client.post(f"{telegram_url}/sendMessage", json={"chat_id": chat_id, "text": reply_text, "parse_mode": "Markdown"})
                 
-        # زر لوحة تحكم المطور الفاخرة (للأدمن فقط)
-        elif user_text == "⚙️ لوحة تحكم المطور" and is_admin:
+        # لوحة تحكم المسؤول السيبرانية
+        elif user_text == "🛠️ 👾 CYBERNETIC CONTROL PANEL 👾 🛠️" and is_admin:
             total_accounts = db.query(Account).count()
             available_count = db.query(Account).filter(Account.is_given == False).count()
             delivered_count = db.query(Account).filter(Account.is_given == True).count()
             
             admin_text = (
-                f"🛡️ **لوحة تحكم المطور الفاخرة** 🛡️\n\n"
-                f"📦 إجمالي الحسابات بالسيستم: `{total_accounts}`\n"
-                f"🟢 الحسابات الجاهزة للتسليم: `{available_count}`\n"
-                f"🔴 الحسابات التي تم توزيعها: `{delivered_count}`\n\n"
-                f"إدارة النظام بالكامل بضغطة زر واحدة عبر الخيارات أدناه 👇"
+                f"┌─── 🌌 **「 CYBER CORE PANEL 」** 🌌\n"
+                f"│\n"
+                f"├── 🟣 **TOTAL ENCRYPTED:** `{total_accounts}`\n"
+                f"├── 🟢 **READY FOR INJECTION:** `{available_count}`\n"
+                f"└── 🔴 **DECOY DISTRIBUTED:** `{delivered_count}`\n"
+                f"│\n"
+                f"└────────────── [ TERMINAL COMMANDS ] 👇"
             )
             async with httpx.AsyncClient(verify=False) as client:
                 await client.post(f"{telegram_url}/sendMessage", json={"chat_id": chat_id, "text": admin_text, "reply_markup": get_inline_control_buttons(), "parse_mode": "Markdown"})
 
         return {"status": "success"}
-        
     except Exception as e:
         db.rollback()
         print(f"Telegram Webhook Error: {str(e)}")
