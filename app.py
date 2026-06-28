@@ -3,7 +3,6 @@ import httpx
 import os
 import logging
 import hashlib
-import json
 from sqlalchemy import create_engine, Column, Integer, String, Boolean, func
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
@@ -55,16 +54,22 @@ Base.metadata.create_all(bind=engine)
 
 
 def config_hash(name: str) -> str:
+    """تجزئة MD5 مختصرة (12 حرف) لتجنب تجاوز حد 64 بايت في callback_data."""
     return hashlib.md5(name.encode("utf-8")).hexdigest()[:12]
 
 
 def safe_md(text: str) -> str:
+    """يستبدل العلامات التي تكسر Markdown v1 في تلغرام."""
     if not text:
         return ""
     return str(text).replace("`", "'").replace("\\", "/")
 
 
 def resolve_progress(val) -> str:
+    """
+    OpenBullet قد يُرجع التقدم كنسبة (0.0-1.0) أو كنسبة مئوية (0-100).
+    هذه الدالة تتعامل مع الحالتين.
+    """
     try:
         p = float(val) if val is not None else 0.0
     except (TypeError, ValueError):
@@ -112,6 +117,7 @@ def get_inline_control_buttons():
 
 
 async def tg_send(chat_id: str, text: str, **kwargs):
+    """إرسال رسالة جديدة."""
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
     payload.update(kwargs)
@@ -123,6 +129,7 @@ async def tg_send(chat_id: str, text: str, **kwargs):
 
 
 async def tg_edit(chat_id: str, message_id: int, text: str, **kwargs):
+    """تعديل رسالة موجودة."""
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/editMessageText"
     payload = {
         "chat_id": chat_id,
@@ -139,6 +146,7 @@ async def tg_edit(chat_id: str, message_id: int, text: str, **kwargs):
 
 
 async def tg_answer(callback_id: str, text: str, show_alert: bool = False):
+    """الرد على callback query."""
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/answerCallbackQuery"
     async with httpx.AsyncClient(verify=False, timeout=10.0) as c:
         try:
@@ -186,7 +194,6 @@ async def _ob_request(client: httpx.AsyncClient, url: str, headers: dict) -> dic
             result["error"] = f"HTTP {resp.status_code}"
             return result
 
-        # محاولة تحليل JSON
         try:
             parsed = resp.json()
             result["ok"] = True
@@ -206,8 +213,13 @@ async def _ob_request(client: httpx.AsyncClient, url: str, headers: dict) -> dic
 
 async def fetch_ob_status() -> dict:
     """
-    يجلب البيانات من OpenBullet مع تشخيص كامل.
-    يُرجع dict يحتوي على البيانات + معلومات التشخيص.
+    يجلب البيانات من OpenBullet مع تجربة 3 صيغ مصادقة تلقائياً:
+      1. Authorization: <key>           (طريقة OB2 الأصلية)
+      2. Authorization: Bearer <key>     (الطريقة القياسية)
+      3. X-API-Key: <key>               (بديل شائع)
+    ثم يجلب:
+      - /api/v1/job/all         (العمليات العادية)
+      - /api/v1/jobmonitor/all  (مراقبات العمليات المستمرة)
     """
     if not OPENBULLET_URL or not OPENBULLET_API_KEY:
         return {
@@ -217,40 +229,94 @@ async def fetch_ob_status() -> dict:
         }
 
     base = OPENBULLET_URL.strip().rstrip("/")
-    headers = {
-        "Authorization": f"Bearer {OPENBULLET_API_KEY.strip()}",
-        "Accept": "application/json",
-    }
+    raw_key = OPENBULLET_API_KEY.strip()
 
-    result = {"jobs": [], "monitors": [], "diag_jobs": None, "diag_monitors": None}
+    # ===== 3 صيغ مختلفة للمصادقة =====
+    auth_methods = [
+        {"Authorization": raw_key},
+        {"Authorization": f"Bearer {raw_key}"},
+        {"X-API-Key": raw_key},
+    ]
+    auth_labels = [
+        "مباشر (بدون Bearer)",
+        "Bearer",
+        "X-API-Key",
+    ]
+
+    # ===== تحديد أي صيغة تعمل =====
+    test_url = f"{base}/api/v1/job/all"
+    working_headers = None
+    working_label = None
+
+    async with httpx.AsyncClient(verify=False, timeout=15.0) as client:
+        for i, hdrs in enumerate(auth_methods):
+            hdrs["Accept"] = "application/json"
+            try:
+                resp = await client.get(test_url, headers=hdrs)
+                logger.info(
+                    f"Auth test #{i+1} ({auth_labels[i]}): "
+                    f"HTTP {resp.status_code} | "
+                    f"type: {resp.headers.get('content-type', '?')}"
+                )
+                if resp.status_code == 200 and "json" in resp.headers.get("content-type", ""):
+                    working_headers = hdrs
+                    working_label = auth_labels[i]
+                    logger.info(f"✅ Auth method #{i+1} ({auth_labels[i]}) WORKS!")
+                    break
+                elif resp.status_code == 401:
+                    logger.warning(f"Auth method #{i+1} ({auth_labels[i]}) -> 401 rejected")
+                else:
+                    logger.warning(f"Auth method #{i+1} ({auth_labels[i]}) -> HTTP {resp.status_code}")
+            except Exception as e:
+                logger.error(f"Auth method #{i+1} ({auth_labels[i]}) -> error: {e}")
+
+    # ===== إذا لم تنجح أي صيغة =====
+    if working_headers is None:
+        return {
+            "jobs": [],
+            "monitors": [],
+            "diag_error": (
+                "فشلت كل صيغ المصادقة (3 طرق).\n\n"
+                f"🔗 الرابط: `{base}`\n"
+                f"🔑 الـ Key: `{raw_key[:8]}...{raw_key[-4:]}`\n\n"
+                "**تأكد من:**\n"
+                "1. فتح OB → Settings → General\n"
+                "2. في حقل **Admin API Key** اكتب نفس المفتاح بالضبط\n"
+                "3. اضغط **Save Settings** (أسفل الصفحة)"
+            ),
+        }
+
+    # ===== جلب البيانات بالصيغة الناجحة =====
+    result = {
+        "jobs": [],
+        "monitors": [],
+        "auth_method": working_label,
+        "diag_jobs": None,
+        "diag_monitors": None,
+    }
 
     async with httpx.AsyncClient(verify=False, timeout=15.0) as client:
 
-        # ---- 1) جلب Jobs ----
-        jobs_diag = await _ob_request(client, f"{base}/api/v1/job/all", headers)
-        result["diag_jobs"] = jobs_diag
-        logger.info(f"OB /job/all diag: ok={jobs_diag['ok']} err={jobs_diag['error']}")
-
-        if jobs_diag["ok"] and jobs_diag["data"] is not None:
-            d = jobs_diag["data"]
+        # ---- Jobs ----
+        jd = await _ob_request(client, f"{base}/api/v1/job/all", working_headers)
+        result["diag_jobs"] = jd
+        if jd["ok"] and jd["data"] is not None:
+            d = jd["data"]
             if isinstance(d, dict) and "items" in d:
                 result["jobs"] = d["items"]
             elif isinstance(d, list):
                 result["jobs"] = d
             elif isinstance(d, dict):
-                # ربما المفاتيح مختلفة - نأخذ القائمة الأولى
                 for v in d.values():
                     if isinstance(v, list):
                         result["jobs"] = v
                         break
 
-        # ---- 2) جلب Job Monitors ----
-        mon_diag = await _ob_request(client, f"{base}/api/v1/jobmonitor/all", headers)
-        result["diag_monitors"] = mon_diag
-        logger.info(f"OB /jobmonitor/all diag: ok={mon_diag['ok']} err={mon_diag['error']}")
-
-        if mon_diag["ok"] and mon_diag["data"] is not None:
-            d = mon_diag["data"]
+        # ---- Job Monitors ----
+        md = await _ob_request(client, f"{base}/api/v1/jobmonitor/all", working_headers)
+        result["diag_monitors"] = md
+        if md["ok"] and md["data"] is not None:
+            d = md["data"]
             if isinstance(d, dict) and "items" in d:
                 result["monitors"] = d["items"]
             elif isinstance(d, list):
@@ -269,13 +335,12 @@ def _is_active(status_val) -> bool:
     if status_val is None:
         return False
     s = str(status_val).strip().lower()
-    # يغطي: RUNNING, Running, running, ACTIVE, Started, إلخ
     return s in ("running", "active", "started", "executing")
 
 
 def _extract_job_info(job: dict) -> dict:
     """
-    يستخرج المعلومات من كائن Job بأقصى مرونة.
+    يستخرج المعلومات من كائن Job بمرونة.
     OpenBullet قد يُسمّي الحقول بأسماء مختلفة بين الإصدارات.
     """
     def get(*keys):
@@ -290,24 +355,24 @@ def _extract_job_info(job: dict) -> dict:
         "progress": get("progress", "completionRate", "percent"),
         "cpm": get("cpm", "speed", "checkSpeed"),
         "hits": get("hits", "hitsCount", "good", "success"),
-        "custom": get("custom", "data"),
     }
 
 
 def format_ob_message(ob_data: dict, show_diag: bool = False) -> str:
     """يحوّل بيانات OpenBullet إلى رسالة تلغرام مع تشخيص ذكي."""
 
-    # ---- إذا كان هناك خطأ إعدادات ----
+    # ---- خطأ إعدادات ----
     if "diag_error" in ob_data:
-        return f"❌ **خطأ في الإعدادات:**\n`{ob_data['diag_error']}`\n\n💡 تحقق من متغيرات البيئة في Render."
+        return f"❌ **خطأ في الإعدادات:**\n{ob_data['diag_error']}"
 
     # ---- تشخيص الاتصال ----
     jd = ob_data.get("diag_jobs") or {}
     md = ob_data.get("diag_monitors") or {}
     jobs_ok = jd.get("ok", False)
     mon_ok = md.get("ok", False)
+    auth_method = ob_data.get("auth_method", "")
 
-    # إذا كلاهما فشل → نعرض تفاصيل الخطأ بدلاً من "خامل"
+    # كلاهما فشل
     if not jobs_ok and not mon_ok:
         err_j = jd.get("error", "غير معروف")
         err_m = md.get("error", "غير معروف")
@@ -324,17 +389,16 @@ def format_ob_message(ob_data: dict, show_diag: bool = False) -> str:
         if "JSON" in err_j or "JSON" in err_m:
             msg += (
                 "⚠️ **السبب المحتمل:** الخادم رد بنص بدلاً من JSON.\n"
-                "هذا يعني غالباً أن:\n"
                 "1. Admin API Key غير مُفعّل في إعدادات OB\n"
-                "2. أو الرابط لا يشير إلى واجهة OB الصحيحة\n\n"
+                "2. أو الرابط لا يشير لواجهة OB الصحيحة\n\n"
                 f"📄 **أول 200 حرف من الرد:**\n`{safe_md(preview)}`\n\n"
-                "💡 اذهب إلى OB → Settings → General → فعّل **Admin API Key** → احفظ."
+                "💡 OB → Settings → General → فعّل **Admin API Key** → احفظ."
             )
         elif "الاتصال" in err_j or "Connect" in err_j:
             msg += (
                 "⚠️ **السبب المحتمل:** تعذّر الوصول للخادم.\n"
-                "1. تأكد أن حاوية HuggingFace تعمل وليست في وضع السكون\n"
-                "2. تأكد أن الرابط صحيح ويحتوي على المنفذ إن لزم\n"
+                "1. تأكد أن حاوية HuggingFace تعمل وليست نائمة\n"
+                "2. تأكد أن الرابط صحيح\n"
                 "3. جرب فتح الرابط في المتصفح للتأكد"
             )
         else:
@@ -364,10 +428,14 @@ def format_ob_message(ob_data: dict, show_diag: bool = False) -> str:
     total_active = len(running_jobs) + len(running_monitors)
     total_all = len(ob_data.get("jobs", [])) + len(ob_data.get("monitors", []))
 
+    auth_line = ""
+    if auth_method:
+        auth_line = f"🔑 **المصادقة:** `{auth_method}`\n"
+
     lines = []
 
+    # ---- لا عمليات نشطة ----
     if total_active == 0:
-        # هنا نميّز بين "لا توجد عمليات فعلاً" و "الرد جاء فارغاً مشبوه"
         if total_all == 0 and (not jobs_ok or not mon_ok):
             # API نجح جزئياً لكن البيانات فارغة - مشبوه
             partial_err = ""
@@ -388,7 +456,7 @@ def format_ob_message(ob_data: dict, show_diag: bool = False) -> str:
                 "\n💡 **احتمالات:**\n"
                 "1. مسار API مختلف عن المتوقع\n"
                 "2. الإصدار لا يدعم هذا الـ Endpoint\n"
-                "3. اضغط على زر التشخيص أدناه لرؤية الرد الخام"
+                "3. لا توجد عمليات حالياً فعلاً"
             )
             if show_diag:
                 lines.append("\n🔍 **[وضع التشخيص مُفعّل]**")
@@ -396,13 +464,16 @@ def format_ob_message(ob_data: dict, show_diag: bool = False) -> str:
 
         lines = [
             "💤 **حالة الـ Mainframe:** `خامل (IDLE)`\n",
+            auth_line,
             f"📊 **إجمالي العمليات المسجلة:** `{total_all}`",
             f"🟢 **العمليات النشطة:** `0`\n",
             "_لا توجد عمليات فحص نشطة حالياً._",
         ]
     else:
+        # ---- عمليات نشطة موجودة ----
         lines = [
             "⚙️ **「 شاشة مراقبة OPENBULLET 」** ⚙️\n",
+            auth_line,
             f"⚡ **العمليات النشطة:** `{total_active}` من `{total_all}`",
             "━━━━━━━━━━━━━━━━━━━━",
         ]
@@ -441,6 +512,7 @@ async def receive_hit(request: Request):
     try:
         data = await request.json()
 
+        # استخراج اسم الكونفق بطرق متعددة
         config_name = "UNKNOWN"
         for key in ("config", "configName", "ConfigName"):
             if data.get(key):
@@ -464,6 +536,7 @@ async def receive_hit(request: Request):
             or data.get("variables") or "NO_CAPTURED_DATA"
         ).strip()[:5000]
 
+        # تجنب التكرار
         if db.query(Account).filter(Account.account_data == account_data).first():
             return {"status": "ignored"}
 
@@ -502,8 +575,11 @@ async def telegram_webhook(request: Request):
             message_id = cb["message"]["message_id"]
             data = cb["data"]
 
+            # ---------- سحب حساب عبر التجزئة ----------
             if data.startswith("claim_cfg:"):
                 cfg_h = data.split("claim_cfg:", 1)[1]
+
+                # البحث عن الكونفق المطابق للتجزئة
                 all_cfgs = (
                     db.query(Account.config_name)
                     .filter(Account.is_given == False)
@@ -519,10 +595,12 @@ async def telegram_webhook(request: Request):
                     await tg_answer(callback_id, "❌ لم يتم العثور على هذا النوع!", show_alert=True)
                     return {"status": "ok"}
 
+                # هل سبق له السحب؟
                 if db.query(DeliveredAccount).filter(DeliveredAccount.user_id == chat_id).first():
                     await tg_answer(callback_id, "❌ لقد سحبت حصتك سابقاً!", show_alert=True)
                     return {"status": "ok"}
 
+                # قفل الصف لمنع السباق (Race Condition)
                 account = (
                     db.query(Account)
                     .filter(Account.config_name == selected, Account.is_given == False)
@@ -547,6 +625,7 @@ async def telegram_webhook(request: Request):
                 await tg_edit(chat_id, message_id, reply)
                 return {"status": "ok"}
 
+            # ---------- أوامر المطور ----------
             if chat_id not in ADMIN_IDS:
                 return {"status": "ok"}
 
@@ -589,6 +668,7 @@ async def telegram_webhook(request: Request):
         text = payload["message"]["text"].strip()
         is_admin = chat_id in ADMIN_IDS
 
+        # ---- /start ----
         if text == "/start":
             await tg_send(
                 chat_id,
@@ -599,6 +679,7 @@ async def telegram_webhook(request: Request):
                 reply_markup=get_main_keyboard(is_admin),
             )
 
+        # ---- إحصائيات ----
         elif text in ("📡 🌐 إحصائيات المخزن 🌐 📡", "/stats"):
             avail = db.query(Account).filter(Account.is_given == False).count()
             await tg_send(
@@ -610,6 +691,7 @@ async def telegram_webhook(request: Request):
                 "└───────────── [ مصفوفة حية ] ⚡",
             )
 
+        # ---- سحب حساب ----
         elif text in ("⚡ 🧬 سحب حساب جديد 🧬 ⚡", "/get"):
             if db.query(DeliveredAccount).filter(DeliveredAccount.user_id == chat_id).first():
                 await tg_send(
@@ -648,10 +730,12 @@ async def telegram_webhook(request: Request):
                     reply_markup={"inline_keyboard": buttons},
                 )
 
+        # ---- عمليات أوبن بلوت ----
         elif text == "🤖 ⚔️ عمليات أوبن بلوت الجارية ⚔️ 🤖":
             ob_data = await fetch_ob_status()
             await tg_send(chat_id, format_ob_message(ob_data))
 
+        # ---- لوحة المطور ----
         elif text == "🛠️ 👾 لوحة تحكم المطور 👾 🛠️" and is_admin:
             total = db.query(Account).count()
             avail = db.query(Account).filter(Account.is_given == False).count()
@@ -699,6 +783,7 @@ async def debug_ob():
             "has_api_key": bool(OPENBULLET_API_KEY),
             "api_key_preview": OPENBULLET_API_KEY[:6] + "..." if OPENBULLET_API_KEY else None,
         },
+        "auth_method_used": ob_data.get("auth_method"),
         "jobs_endpoint": ob_data.get("diag_jobs"),
         "monitors_endpoint": ob_data.get("diag_monitors"),
         "parsed_jobs_count": len(ob_data.get("jobs", [])),
@@ -710,6 +795,10 @@ async def debug_ob():
 
 @app.post("/setup/webhook")
 async def setup_webhook():
+    """
+    استدعِ هذا Endpoint مرة واحدة بعد النشر لربط الويب هوك:
+    POST https://your-app.onrender.com/setup/webhook
+    """
     render_url = os.getenv("RENDER_EXTERNAL_URL", "")
     if not render_url:
         return {"error": "RENDER_EXTERNAL_URL not set"}
