@@ -3,6 +3,7 @@ import httpx
 import os
 import logging
 import hashlib
+import json
 from sqlalchemy import create_engine, Column, Integer, String, Boolean, func
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
@@ -54,25 +55,16 @@ Base.metadata.create_all(bind=engine)
 
 
 def config_hash(name: str) -> str:
-    """
-    يُنشئ تجزئة قصيرة (12 حرف) لاسم الكونفق
-    لأن تلغرام يحدد callback_data بـ 64 بايت كحد أقصى.
-    """
     return hashlib.md5(name.encode("utf-8")).hexdigest()[:12]
 
 
 def safe_md(text: str) -> str:
-    """يستبدل العلامات التي تكسر Markdown v1 في تلغرام."""
     if not text:
         return ""
     return str(text).replace("`", "'").replace("\\", "/")
 
 
 def resolve_progress(val) -> str:
-    """
-    OpenBullet قد يُرجع التقدم كنسبة (0.0 - 1.0) أو كنسبة مئوية (0 - 100).
-    هذه الدالة تتعامل مع الحالتين.
-    """
     try:
         p = float(val) if val is not None else 0.0
     except (TypeError, ValueError):
@@ -120,7 +112,6 @@ def get_inline_control_buttons():
 
 
 async def tg_send(chat_id: str, text: str, **kwargs):
-    """إرسال رسالة جديدة."""
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
     payload.update(kwargs)
@@ -132,7 +123,6 @@ async def tg_send(chat_id: str, text: str, **kwargs):
 
 
 async def tg_edit(chat_id: str, message_id: int, text: str, **kwargs):
-    """تعديل رسالة موجودة."""
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/editMessageText"
     payload = {
         "chat_id": chat_id,
@@ -149,7 +139,6 @@ async def tg_edit(chat_id: str, message_id: int, text: str, **kwargs):
 
 
 async def tg_answer(callback_id: str, text: str, show_alert: bool = False):
-    """الرد على callback query."""
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/answerCallbackQuery"
     async with httpx.AsyncClient(verify=False, timeout=10.0) as c:
         try:
@@ -168,15 +157,64 @@ async def tg_answer(callback_id: str, text: str, show_alert: bool = False):
 # ==================== OPENBULLET API CLIENT ====================
 
 
+async def _ob_request(client: httpx.AsyncClient, url: str, headers: dict) -> dict:
+    """
+    طلب موحّد يعيد {
+        "ok": bool,
+        "data": list|dict|None,
+        "status_code": int,
+        "content_type": str,
+        "raw_preview": str,
+        "error": str|None
+    }
+    """
+    result = {
+        "ok": False,
+        "data": None,
+        "status_code": 0,
+        "content_type": "",
+        "raw_preview": "",
+        "error": None,
+    }
+    try:
+        resp = await client.get(url, headers=headers)
+        result["status_code"] = resp.status_code
+        result["content_type"] = resp.headers.get("content-type", "")
+        result["raw_preview"] = resp.text[:500]
+
+        if resp.status_code != 200:
+            result["error"] = f"HTTP {resp.status_code}"
+            return result
+
+        # محاولة تحليل JSON
+        try:
+            parsed = resp.json()
+            result["ok"] = True
+            result["data"] = parsed
+        except Exception:
+            result["error"] = "الرد ليس JSON"
+
+    except httpx.ConnectError:
+        result["error"] = "فشل الاتصال (رابط خاطئ أو الخادم متوقف)"
+    except httpx.TimeoutException:
+        result["error"] = "انتهت مهلة الاتصال (Timeout)"
+    except Exception as e:
+        result["error"] = str(e)
+
+    return result
+
+
 async def fetch_ob_status() -> dict:
     """
-    يجلب البيانات من OpenBullet عبر المسارات الصحيحة:
-      - /api/v1/job/all        (العمليات العادية)
-      - /api/v1/jobmonitor/all  (مراقبات العمليات المستمرة)
-    حسب ما تظهره واجهة API في الصورة المرفقة.
+    يجلب البيانات من OpenBullet مع تشخيص كامل.
+    يُرجع dict يحتوي على البيانات + معلومات التشخيص.
     """
     if not OPENBULLET_URL or not OPENBULLET_API_KEY:
-        return {"error": "متغيرات OPENBULLET_URL أو OPENBULLET_API_KEY غير معرّفة."}
+        return {
+            "jobs": [],
+            "monitors": [],
+            "diag_error": "متغيرات OPENBULLET_URL أو OPENBULLET_API_KEY غير معرّفة.",
+        }
 
     base = OPENBULLET_URL.strip().rstrip("/")
     headers = {
@@ -184,105 +222,213 @@ async def fetch_ob_status() -> dict:
         "Accept": "application/json",
     }
 
-    result = {"jobs": [], "monitors": []}
+    result = {"jobs": [], "monitors": [], "diag_jobs": None, "diag_monitors": None}
 
     async with httpx.AsyncClient(verify=False, timeout=15.0) as client:
+
         # ---- 1) جلب Jobs ----
-        try:
-            resp = await client.get(f"{base}/api/v1/job/all", headers=headers)
-            logger.info(f"OB /job/all -> {resp.status_code}")
-            if resp.status_code == 200 and "json" in resp.headers.get("content-type", ""):
-                data = resp.json()
-                # OpenBullet قد يُرجع {"items": [...]} أو مصفوفة مباشرة
-                if isinstance(data, dict) and "items" in data:
-                    result["jobs"] = data["items"]
-                elif isinstance(data, list):
-                    result["jobs"] = data
-                else:
-                    logger.warning(f"Unexpected /job/all format: {type(data)}")
-            else:
-                logger.warning(f"/job/all bad response: {resp.status_code} | {resp.text[:200]}")
-        except Exception as e:
-            logger.error(f"Error fetching /job/all: {e}")
-            result["jobs_error"] = str(e)
+        jobs_diag = await _ob_request(client, f"{base}/api/v1/job/all", headers)
+        result["diag_jobs"] = jobs_diag
+        logger.info(f"OB /job/all diag: ok={jobs_diag['ok']} err={jobs_diag['error']}")
+
+        if jobs_diag["ok"] and jobs_diag["data"] is not None:
+            d = jobs_diag["data"]
+            if isinstance(d, dict) and "items" in d:
+                result["jobs"] = d["items"]
+            elif isinstance(d, list):
+                result["jobs"] = d
+            elif isinstance(d, dict):
+                # ربما المفاتيح مختلفة - نأخذ القائمة الأولى
+                for v in d.values():
+                    if isinstance(v, list):
+                        result["jobs"] = v
+                        break
 
         # ---- 2) جلب Job Monitors ----
-        try:
-            resp = await client.get(f"{base}/api/v1/jobmonitor/all", headers=headers)
-            logger.info(f"OB /jobmonitor/all -> {resp.status_code}")
-            if resp.status_code == 200 and "json" in resp.headers.get("content-type", ""):
-                data = resp.json()
-                if isinstance(data, dict) and "items" in data:
-                    result["monitors"] = data["items"]
-                elif isinstance(data, list):
-                    result["monitors"] = data
-                else:
-                    logger.warning(f"Unexpected /jobmonitor/all format: {type(data)}")
-            else:
-                logger.warning(
-                    f"/jobmonitor/all bad response: {resp.status_code} | {resp.text[:200]}"
-                )
-        except Exception as e:
-            logger.error(f"Error fetching /jobmonitor/all: {e}")
-            result["monitors_error"] = str(e)
+        mon_diag = await _ob_request(client, f"{base}/api/v1/jobmonitor/all", headers)
+        result["diag_monitors"] = mon_diag
+        logger.info(f"OB /jobmonitor/all diag: ok={mon_diag['ok']} err={mon_diag['error']}")
+
+        if mon_diag["ok"] and mon_diag["data"] is not None:
+            d = mon_diag["data"]
+            if isinstance(d, dict) and "items" in d:
+                result["monitors"] = d["items"]
+            elif isinstance(d, list):
+                result["monitors"] = d
+            elif isinstance(d, dict):
+                for v in d.values():
+                    if isinstance(v, list):
+                        result["monitors"] = v
+                        break
 
     return result
 
 
-def format_ob_message(ob_data: dict) -> str:
-    """يحوّل بيانات OpenBullet الخام إلى رسالة تلغرام منسّقة."""
-    if "error" in ob_data:
-        return f"❌ **خطأ في الإعدادات:**\n`{ob_data['error']}`\n\n💡 تحقق من متغيرات البيئة في Render."
+def _is_active(status_val) -> bool:
+    """يحقق مما إذا كانت الحالة تعني 'قيد التشغيل'."""
+    if status_val is None:
+        return False
+    s = str(status_val).strip().lower()
+    # يغطي: RUNNING, Running, running, ACTIVE, Started, إلخ
+    return s in ("running", "active", "started", "executing")
 
-    # الحالات التي تعني "قيد التشغيل" (حالة صغيرة للمقارنة)
-    active_statuses = {"running", "active", "started"}
 
-    running_jobs = [
-        j for j in ob_data.get("jobs", [])
-        if isinstance(j, dict) and str(j.get("status", "")).lower() in active_statuses
-    ]
-    running_monitors = [
-        m for m in ob_data.get("monitors", [])
-        if isinstance(m, dict) and str(m.get("status", "")).lower() in active_statuses
-    ]
+def _extract_job_info(job: dict) -> dict:
+    """
+    يستخرج المعلومات من كائن Job بأقصى مرونة.
+    OpenBullet قد يُسمّي الحقول بأسماء مختلفة بين الإصدارات.
+    """
+    def get(*keys):
+        for k in keys:
+            if k in job and job[k] is not None:
+                return job[k]
+        return None
+
+    return {
+        "name": get("name", "jobName", "configName", "id"),
+        "status": get("status", "state", "jobStatus"),
+        "progress": get("progress", "completionRate", "percent"),
+        "cpm": get("cpm", "speed", "checkSpeed"),
+        "hits": get("hits", "hitsCount", "good", "success"),
+        "custom": get("custom", "data"),
+    }
+
+
+def format_ob_message(ob_data: dict, show_diag: bool = False) -> str:
+    """يحوّل بيانات OpenBullet إلى رسالة تلغرام مع تشخيص ذكي."""
+
+    # ---- إذا كان هناك خطأ إعدادات ----
+    if "diag_error" in ob_data:
+        return f"❌ **خطأ في الإعدادات:**\n`{ob_data['diag_error']}`\n\n💡 تحقق من متغيرات البيئة في Render."
+
+    # ---- تشخيص الاتصال ----
+    jd = ob_data.get("diag_jobs") or {}
+    md = ob_data.get("diag_monitors") or {}
+    jobs_ok = jd.get("ok", False)
+    mon_ok = md.get("ok", False)
+
+    # إذا كلاهما فشل → نعرض تفاصيل الخطأ بدلاً من "خامل"
+    if not jobs_ok and not mon_ok:
+        err_j = jd.get("error", "غير معروف")
+        err_m = md.get("error", "غير معروف")
+        code_j = jd.get("status_code", "?")
+        code_m = md.get("status_code", "?")
+        preview = (jd.get("raw_preview") or md.get("raw_preview") or "فارغ")[:200]
+
+        msg = (
+            "🚨 **فشل الاتصال بأوبن بلوت** 🚨\n\n"
+            f"🔗 **الرابط المستخدم:**\n`{OPENBULLET_URL}`\n\n"
+            f"❌ **خطأ /job/all:** `{err_j}` (HTTP {code_j})\n"
+            f"❌ **خطأ /jobmonitor/all:** `{err_m}` (HTTP {code_m})\n\n"
+        )
+        if "JSON" in err_j or "JSON" in err_m:
+            msg += (
+                "⚠️ **السبب المحتمل:** الخادم رد بنص بدلاً من JSON.\n"
+                "هذا يعني غالباً أن:\n"
+                "1. Admin API Key غير مُفعّل في إعدادات OB\n"
+                "2. أو الرابط لا يشير إلى واجهة OB الصحيحة\n\n"
+                f"📄 **أول 200 حرف من الرد:**\n`{safe_md(preview)}`\n\n"
+                "💡 اذهب إلى OB → Settings → General → فعّل **Admin API Key** → احفظ."
+            )
+        elif "الاتصال" in err_j or "Connect" in err_j:
+            msg += (
+                "⚠️ **السبب المحتمل:** تعذّر الوصول للخادم.\n"
+                "1. تأكد أن حاوية HuggingFace تعمل وليست في وضع السكون\n"
+                "2. تأكد أن الرابط صحيح ويحتوي على المنفذ إن لزم\n"
+                "3. جرب فتح الرابط في المتصفح للتأكد"
+            )
+        else:
+            msg += f"📄 **تفاصيل:**\n`{safe_md(preview)}`"
+
+        if show_diag:
+            msg += "\n\n🔍 **[وضع التشخيص مُفعّل]**"
+        return msg
+
+    # ---- تحليل العمليات النشطة ----
+    running_jobs = []
+    for j in ob_data.get("jobs", []):
+        if not isinstance(j, dict):
+            continue
+        info = _extract_job_info(j)
+        if _is_active(info["status"]):
+            running_jobs.append(info)
+
+    running_monitors = []
+    for m in ob_data.get("monitors", []):
+        if not isinstance(m, dict):
+            continue
+        info = _extract_job_info(m)
+        if _is_active(info["status"]):
+            running_monitors.append(info)
 
     total_active = len(running_jobs) + len(running_monitors)
     total_all = len(ob_data.get("jobs", [])) + len(ob_data.get("monitors", []))
 
+    lines = []
+
     if total_active == 0:
-        return (
-            f"💤 **حالة الـ Mainframe:** `خامل (IDLE)`\n\n"
-            f"📊 **إجمالي العمليات المسجلة:** `{total_all}`\n"
-            f"🟢 **العمليات النشطة:** `0`\n\n"
-            f"_لا توجد عمليات فحص نشطة حالياً على الخادم._"
-        )
+        # هنا نميّز بين "لا توجد عمليات فعلاً" و "الرد جاء فارغاً مشبوه"
+        if total_all == 0 and (not jobs_ok or not mon_ok):
+            # API نجح جزئياً لكن البيانات فارغة - مشبوه
+            partial_err = ""
+            if not jobs_ok:
+                partial_err += f"\n⚠️ /job/all فشل: `{jd.get('error')}`"
+            if not mon_ok:
+                partial_err += f"\n⚠️ /jobmonitor/all فشل: `{md.get('error')}`"
+            preview = (jd.get("raw_preview") or md.get("raw_preview") or "")[:150]
 
-    lines = [
-        "⚙️ **「 شاشة مراقبة OPENBULLET 」** ⚙️\n",
-        f"⚡ **العمليات النشطة:** `{total_active}` من `{total_all}`",
-        "━━━━━━━━━━━━━━━━━━━━",
-    ]
+            lines = [
+                "⚠️ **تنبيه:** لم يتم العثور على عمليات رغم نجاح جزئي للاتصال.",
+                f"📊 إجمالي ما تم جلبه: `{total_all}` عملية",
+                partial_err,
+            ]
+            if preview:
+                lines.append(f"\n📄 **عينة الرد:**\n`{safe_md(preview)}`")
+            lines.append(
+                "\n💡 **احتمالات:**\n"
+                "1. مسار API مختلف عن المتوقع\n"
+                "2. الإصدار لا يدعم هذا الـ Endpoint\n"
+                "3. اضغط على زر التشخيص أدناه لرؤية الرد الخام"
+            )
+            if show_diag:
+                lines.append("\n🔍 **[وضع التشخيص مُفعّل]**")
+            return "\n".join(lines)
 
-    for job in running_jobs:
-        name = safe_md(job.get("name", "بدون اسم"))
-        lines += [
-            f"📦 **عملية عادية:** `{name}`",
-            f"   📊 التقدم: `{resolve_progress(job.get('progress'))}%`",
-            f"   ⚡ السرعة: `{job.get('cpm', 0) or 0}` CPM",
-            f"   🎯 Hits: `{job.get('hits', 0) or 0}`",
+        lines = [
+            "💤 **حالة الـ Mainframe:** `خامل (IDLE)`\n",
+            f"📊 **إجمالي العمليات المسجلة:** `{total_all}`",
+            f"🟢 **العمليات النشطة:** `0`\n",
+            "_لا توجد عمليات فحص نشطة حالياً._",
+        ]
+    else:
+        lines = [
+            "⚙️ **「 شاشة مراقبة OPENBULLET 」** ⚙️\n",
+            f"⚡ **العمليات النشطة:** `{total_active}` من `{total_all}`",
             "━━━━━━━━━━━━━━━━━━━━",
         ]
 
-    for mon in running_monitors:
-        name = safe_md(mon.get("name", "بدون اسم"))
-        lines += [
-            f"🔄 **مراقب مستمر:** `{name}`",
-            f"   📊 التقدم: `{resolve_progress(mon.get('progress'))}%`",
-            f"   ⚡ السرعة: `{mon.get('cpm', 0) or 0}` CPM",
-            f"   🎯 Hits: `{mon.get('hits', 0) or 0}`",
-            "━━━━━━━━━━━━━━━━━━━━",
-        ]
+        for job in running_jobs:
+            name = safe_md(job["name"] or "بدون اسم")
+            lines += [
+                f"📦 **عملية عادية:** `{name}`",
+                f"   📊 التقدم: `{resolve_progress(job['progress'])}%`",
+                f"   ⚡ السرعة: `{job['cpm'] or 0}` CPM",
+                f"   🎯 Hits: `{job['hits'] or 0}`",
+                "━━━━━━━━━━━━━━━━━━━━",
+            ]
 
+        for mon in running_monitors:
+            name = safe_md(mon["name"] or "بدون اسم")
+            lines += [
+                f"🔄 **مراقب مستمر:** `{name}`",
+                f"   📊 التقدم: `{resolve_progress(mon['progress'])}%`",
+                f"   ⚡ السرعة: `{mon['cpm'] or 0}` CPM",
+                f"   🎯 Hits: `{mon['hits'] or 0}`",
+                "━━━━━━━━━━━━━━━━━━━━",
+            ]
+
+    if show_diag:
+        lines.append("\n🔍 **[وضع التشخيص مُفعّل]**")
     return "\n".join(lines)
 
 
@@ -295,7 +441,6 @@ async def receive_hit(request: Request):
     try:
         data = await request.json()
 
-        # استخراج اسم الكونفق بطرق متعددة
         config_name = "UNKNOWN"
         for key in ("config", "configName", "ConfigName"):
             if data.get(key):
@@ -304,38 +449,32 @@ async def receive_hit(request: Request):
         if config_name == "UNKNOWN" and data.get("variables"):
             for var in data.get("variables", []):
                 if isinstance(var, dict) and var.get("name") in (
-                    "Config.Name",
-                    "config",
-                    "Config",
+                    "Config.Name", "config", "Config",
                 ):
                     config_name = var.get("value", "UNKNOWN")
                     break
 
         config_name = (
             os.path.basename(str(config_name))
-            .replace(".anom", "")
-            .replace(".opk", "")
-            .strip()
+            .replace(".anom", "").replace(".opk", "").strip()
         )
         account_data = str(data.get("data") or data.get("account") or "NO_DATA").strip()
         captured_data = str(
-            data.get("captured") or data.get("capturedData") or data.get("variables") or "NO_CAPTURED_DATA"
-        ).strip()[:5000]  # حد أقصى لتجنب تخزين بيانات ضخمة
+            data.get("captured") or data.get("capturedData")
+            or data.get("variables") or "NO_CAPTURED_DATA"
+        ).strip()[:5000]
 
-        # تجنب التكرار
-        exists = db.query(Account).filter(Account.account_data == account_data).first()
-        if exists:
+        if db.query(Account).filter(Account.account_data == account_data).first():
             return {"status": "ignored"}
 
-        new_acc = Account(
+        db.add(Account(
             config_name=config_name or "UNKNOWN",
             account_data=account_data,
             captured_data=captured_data,
             is_given=False,
-        )
-        db.add(new_acc)
+        ))
         db.commit()
-        logger.info(f"New hit stored: {config_name}")
+        logger.info(f"Hit stored: {config_name}")
         return {"status": "success"}
 
     except Exception as e:
@@ -363,16 +502,12 @@ async def telegram_webhook(request: Request):
             message_id = cb["message"]["message_id"]
             data = cb["data"]
 
-            # ---------- سحب حساب عبر التجزئة ----------
             if data.startswith("claim_cfg:"):
                 cfg_h = data.split("claim_cfg:", 1)[1]
-
-                # البحث عن الكونفق المطابق للتجزئة
                 all_cfgs = (
                     db.query(Account.config_name)
                     .filter(Account.is_given == False)
-                    .distinct()
-                    .all()
+                    .distinct().all()
                 )
                 selected = None
                 for (name,) in all_cfgs:
@@ -384,29 +519,18 @@ async def telegram_webhook(request: Request):
                     await tg_answer(callback_id, "❌ لم يتم العثور على هذا النوع!", show_alert=True)
                     return {"status": "ok"}
 
-                # هل سبق له السحب؟
                 if db.query(DeliveredAccount).filter(DeliveredAccount.user_id == chat_id).first():
-                    await tg_answer(
-                        callback_id,
-                        "❌ حظر: لقد سحبت حصتك سابقاً!",
-                        show_alert=True,
-                    )
+                    await tg_answer(callback_id, "❌ لقد سحبت حصتك سابقاً!", show_alert=True)
                     return {"status": "ok"}
 
-                # قفل الصف لمنع السباق (Race Condition)
                 account = (
                     db.query(Account)
                     .filter(Account.config_name == selected, Account.is_given == False)
-                    .with_for_update()
-                    .first()
+                    .with_for_update().first()
                 )
 
                 if not account:
-                    await tg_answer(
-                        callback_id,
-                        "😔 نفدت الحسابات من هذا النوع حالياً!",
-                        show_alert=True,
-                    )
+                    await tg_answer(callback_id, "😔 نفدت الحسابات من هذا النوع!", show_alert=True)
                     return {"status": "ok"}
 
                 account.is_given = True
@@ -423,7 +547,6 @@ async def telegram_webhook(request: Request):
                 await tg_edit(chat_id, message_id, reply)
                 return {"status": "ok"}
 
-            # ---------- أوامر المطور ----------
             if chat_id not in ADMIN_IDS:
                 return {"status": "ok"}
 
@@ -434,16 +557,12 @@ async def telegram_webhook(request: Request):
                 await tg_answer(callback_id, f"🧹 تم تصفير الموزع ({count} سجل)", show_alert=True)
 
             elif data == "clear_accounts":
-                acc_count = db.query(Account).count()
-                del_count = db.query(DeliveredAccount).count()
+                ac = db.query(Account).count()
+                dc = db.query(DeliveredAccount).count()
                 db.query(DeliveredAccount).delete()
                 db.query(Account).delete()
                 db.commit()
-                await tg_answer(
-                    callback_id,
-                    f"🚨 تم مسح {acc_count} حساب و {del_count} سجل موزع.",
-                    show_alert=True,
-                )
+                await tg_answer(callback_id, f"🚨 مسح {ac} حساب و {dc} سجل موزع.", show_alert=True)
 
             elif data == "refresh_admin_stats":
                 total = db.query(Account).count()
@@ -470,7 +589,6 @@ async def telegram_webhook(request: Request):
         text = payload["message"]["text"].strip()
         is_admin = chat_id in ADMIN_IDS
 
-        # ---- /start ----
         if text == "/start":
             await tg_send(
                 chat_id,
@@ -481,7 +599,6 @@ async def telegram_webhook(request: Request):
                 reply_markup=get_main_keyboard(is_admin),
             )
 
-        # ---- إحصائيات ----
         elif text in ("📡 🌐 إحصائيات المخزن 🌐 📡", "/stats"):
             avail = db.query(Account).filter(Account.is_given == False).count()
             await tg_send(
@@ -493,21 +610,19 @@ async def telegram_webhook(request: Request):
                 "└───────────── [ مصفوفة حية ] ⚡",
             )
 
-        # ---- سحب حساب ----
         elif text in ("⚡ 🧬 سحب حساب جديد 🧬 ⚡", "/get"):
             if db.query(DeliveredAccount).filter(DeliveredAccount.user_id == chat_id).first():
                 await tg_send(
                     chat_id,
                     "🚨 **SYSTEM DENIAL:** `جدار الحماية نشط` 🚨\n\n"
-                    "❌ يسمح النظام بـ **حساب واحد فقط لكل مستخدم** لضمان العدالة.",
+                    "❌ يسمح النظام بـ **حساب واحد فقط لكل مستخدم**.",
                 )
                 return {"status": "ok"}
 
             results = (
                 db.query(Account.config_name, func.count(Account.id))
                 .filter(Account.is_given == False)
-                .group_by(Account.config_name)
-                .all()
+                .group_by(Account.config_name).all()
             )
             results = [(c, n) for c, n in results if c]
 
@@ -521,9 +636,8 @@ async def telegram_webhook(request: Request):
                 buttons = []
                 for cfg_name, count in results:
                     display = cfg_name if len(cfg_name) <= 40 else cfg_name[:37] + "..."
-                    h = config_hash(cfg_name)
                     buttons.append(
-                        [{"text": f"🎁 {display} ({count})", "callback_data": f"claim_cfg:{h}"}]
+                        [{"text": f"🎁 {display} ({count})", "callback_data": f"claim_cfg:{config_hash(cfg_name)}"}]
                     )
                 await tg_send(
                     chat_id,
@@ -534,12 +648,10 @@ async def telegram_webhook(request: Request):
                     reply_markup={"inline_keyboard": buttons},
                 )
 
-        # ---- عمليات أوبن بلوت ----
         elif text == "🤖 ⚔️ عمليات أوبن بلوت الجارية ⚔️ 🤖":
             ob_data = await fetch_ob_status()
             await tg_send(chat_id, format_ob_message(ob_data))
 
-        # ---- لوحة المطور ----
         elif text == "🛠️ 👾 لوحة تحكم المطور 👾 🛠️" and is_admin:
             total = db.query(Account).count()
             avail = db.query(Account).filter(Account.is_given == False).count()
@@ -566,7 +678,7 @@ async def telegram_webhook(request: Request):
         db.close()
 
 
-# ==================== UTILITY ENDPOINTS ====================
+# ==================== DEBUG & UTILITY ENDPOINTS ====================
 
 
 @app.get("/health")
@@ -574,12 +686,30 @@ def health_check():
     return {"status": "healthy"}
 
 
+@app.get("/debug/ob")
+async def debug_ob():
+    """
+    Endpoint لتشخيص مشاكل الاتصال بأوبن بلوت.
+    افتحه في المتصفح لترى الرد الخام من OpenBullet.
+    """
+    ob_data = await fetch_ob_status()
+    return {
+        "config": {
+            "url": OPENBULLET_URL,
+            "has_api_key": bool(OPENBULLET_API_KEY),
+            "api_key_preview": OPENBULLET_API_KEY[:6] + "..." if OPENBULLET_API_KEY else None,
+        },
+        "jobs_endpoint": ob_data.get("diag_jobs"),
+        "monitors_endpoint": ob_data.get("diag_monitors"),
+        "parsed_jobs_count": len(ob_data.get("jobs", [])),
+        "parsed_monitors_count": len(ob_data.get("monitors", [])),
+        "first_job_raw": ob_data.get("jobs", [None])[0] if ob_data.get("jobs") else None,
+        "first_monitor_raw": ob_data.get("monitors", [None])[0] if ob_data.get("monitors") else None,
+    }
+
+
 @app.post("/setup/webhook")
-async def setup_webhook(request: Request):
-    """
-    استدعِ هذا Endpoint مرة واحدة بعد النشر لربط الويب هوك:
-    POST https://your-render-app.onrender.com/setup/webhook
-    """
+async def setup_webhook():
     render_url = os.getenv("RENDER_EXTERNAL_URL", "")
     if not render_url:
         return {"error": "RENDER_EXTERNAL_URL not set"}
