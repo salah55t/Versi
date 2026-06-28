@@ -64,7 +64,6 @@ def safe_md(text: str) -> str:
 
 
 def resolve_progress(val) -> str:
-    """يتعامل مع: 0.45 (نسبة عشرية) أو 45.0 (نسبة مئوية) أو None."""
     try:
         p = float(val) if val is not None else 0.0
     except (TypeError, ValueError):
@@ -157,284 +156,279 @@ async def tg_answer(callback_id: str, text: str, show_alert: bool = False):
 # ==================== OPENBULLET API CLIENT ====================
 
 
-async def _ob_request(client: httpx.AsyncClient, url: str, headers: dict) -> dict:
-    """طلب موحّد بإرجاع تفاصيل كاملة."""
-    result = {
-        "ok": False,
-        "data": None,
-        "status_code": 0,
-        "content_type": "",
-        "raw_preview": "",
-        "error": None,
-    }
-    try:
-        resp = await client.get(url, headers=headers)
-        result["status_code"] = resp.status_code
-        result["content_type"] = resp.headers.get("content-type", "")
-        result["raw_preview"] = resp.text[:1000]
-
-        if resp.status_code != 200:
-            result["error"] = f"HTTP {resp.status_code}"
-            return result
-
-        try:
-            parsed = resp.json()
-            result["ok"] = True
-            result["data"] = parsed
-        except Exception:
-            result["error"] = "الرد ليس JSON"
-
-    except httpx.ConnectError:
-        result["error"] = "فشل الاتصال (رابط خاطئ أو الخادم متوقف)"
-    except httpx.TimeoutException:
-        result["error"] = "انتهت مهلة الاتصال (Timeout)"
-    except Exception as e:
-        result["error"] = str(e)
-
-    return result
-
-
-async def fetch_ob_status() -> dict:
+def _find_auth(base: str, raw_key: str) -> tuple:
     """
-    يجلب البيانات من OpenBullet مع تجربة 3 صيغ مصادقة تلقائياً.
+    يجرب 3 صيغ مصادقة ويرجع (headers, label) للصيغة الناجحة أو (None, None).
     """
-    if not OPENBULLET_URL or not OPENBULLET_API_KEY:
-        return {
-            "jobs": [],
-            "monitors": [],
-            "diag_error": "متغيرات OPENBULLET_URL أو OPENBULLET_API_KEY غير معرّفة.",
-        }
-
-    base = OPENBULLET_URL.strip().rstrip("/")
-    raw_key = OPENBULLET_API_KEY.strip()
-
-    auth_methods = [
-        {"Authorization": raw_key},
-        {"Authorization": f"Bearer {raw_key}"},
-        {"X-API-Key": raw_key},
+    methods = [
+        ({"Authorization": raw_key, "Accept": "application/json"}, "مباشر"),
+        ({"Authorization": f"Bearer {raw_key}", "Accept": "application/json"}, "Bearer"),
+        ({"X-API-Key": raw_key, "Accept": "application/json"}, "X-API-Key"),
     ]
-    auth_labels = ["مباشر", "Bearer", "X-API-Key"]
 
-    test_url = f"{base}/api/v1/job/all"
-    working_headers = None
-    working_label = None
+    async def _test():
+        async with httpx.AsyncClient(verify=False, timeout=15.0) as client:
+            for hdrs, label in methods:
+                try:
+                    resp = await client.get(f"{base}/api/v1/job/all", headers=hdrs)
+                    if resp.status_code == 200 and "json" in resp.headers.get("content-type", ""):
+                        return hdrs, label
+                except Exception:
+                    pass
+        return None, None
 
+    # لا يمكن استدعاء async هنا مباشرة، سنستخدمها في fetch_ob_status
+    return methods  # نرجع القائمة لاستخدامها هناك
+
+
+async def _auto_auth(base: str, raw_key: str) -> tuple:
+    """يجرب صيغ المصادقة ويرجع (headers, label)."""
+    methods = [
+        ({"Authorization": raw_key, "Accept": "application/json"}, "مباشر"),
+        ({"Authorization": f"Bearer {raw_key}", "Accept": "application/json"}, "Bearer"),
+        ({"X-API-Key": raw_key, "Accept": "application/json"}, "X-API-Key"),
+    ]
     async with httpx.AsyncClient(verify=False, timeout=15.0) as client:
-        for i, hdrs in enumerate(auth_methods):
-            hdrs["Accept"] = "application/json"
+        for hdrs, label in methods:
             try:
-                resp = await client.get(test_url, headers=hdrs)
+                resp = await client.get(f"{base}/api/v1/job/all", headers=hdrs)
                 if resp.status_code == 200 and "json" in resp.headers.get("content-type", ""):
-                    working_headers = hdrs
-                    working_label = auth_labels[i]
-                    logger.info(f"✅ Auth #{i+1} ({auth_labels[i]}) WORKS!")
-                    break
+                    logger.info(f"✅ Auth '{label}' works")
+                    return hdrs, label
             except Exception as e:
-                logger.error(f"Auth #{i+1} error: {e}")
-
-    if working_headers is None:
-        return {
-            "jobs": [],
-            "monitors": [],
-            "diag_error": (
-                "فشلت كل صيغ المصادقة.\n\n"
-                f"🔗 الرابط: `{base}`\n"
-                f"🔑 المفتاح: `{raw_key}`\n\n"
-                "**تأكد:**\n"
-                "1. OB → Settings → General\n"
-                "2. حقل Admin API Key → الصق المفتاح بالضبط\n"
-                "3. Save Settings"
-            ),
-        }
-
-    result = {
-        "jobs": [],
-        "monitors": [],
-        "auth_method": working_label,
-        "raw_jobs": None,
-        "raw_monitors": None,
-    }
-
-    async with httpx.AsyncClient(verify=False, timeout=15.0) as client:
-        jd = await _ob_request(client, f"{base}/api/v1/job/all", working_headers)
-        if jd["ok"] and jd["data"] is not None:
-            result["raw_jobs"] = jd["data"]
-            d = jd["data"]
-            if isinstance(d, dict) and "items" in d:
-                result["jobs"] = d["items"]
-            elif isinstance(d, list):
-                result["jobs"] = d
-            elif isinstance(d, dict):
-                for v in d.values():
-                    if isinstance(v, list):
-                        result["jobs"] = v
-                        break
-
-        md = await _ob_request(client, f"{base}/api/v1/jobmonitor/all", working_headers)
-        if md["ok"] and md["data"] is not None:
-            result["raw_monitors"] = md["data"]
-            d = md["data"]
-            if isinstance(d, dict) and "items" in d:
-                result["monitors"] = d["items"]
-            elif isinstance(d, list):
-                result["monitors"] = d
-            elif isinstance(d, dict):
-                for v in d.values():
-                    if isinstance(v, list):
-                        result["monitors"] = v
-                        break
-
-    return result
+                logger.error(f"Auth '{label}' error: {e}")
+    return None, None
 
 
-# ==================== OB2 DATA EXTRACTOR ====================
-
-
-def _unwrap_ob2(obj: dict) -> dict:
-    """
-    OpenBullet 2 يغلّف البيانات الحقيقية داخل حقل 'value'.
-    هذه الدالة تفك هذا الغلاف إذا وُجد.
-    
-    مثال:
-      المدخل: {"id": "abc", "value": {"name": "Job1", "status": "Running"}}
-      المخرج: {"id": "abc", "name": "Job1", "status": "Running"}
-    """
+def _unwrap(obj: dict) -> dict:
+    """يفك غلاف 'value' إن وُجد (OB2 pattern)."""
     if not isinstance(obj, dict):
         return obj
-
-    # إذا فيه حقل value وهو dict → ندمج محتواه مع المستوى الأعلى
     if "value" in obj and isinstance(obj["value"], dict):
-        unwrapped = {k: v for k, v in obj.items() if k != "value"}
-        unwrapped.update(obj["value"])
-        logger.info(f"Unwrapped OB2 'value' field. Keys now: {list(unwrapped.keys())}")
-        return unwrapped
-
+        merged = {k: v for k, v in obj.items() if k != "value"}
+        merged.update(obj["value"])
+        return merged
     return obj
 
 
-def _get(obj: dict, *keys, default=None):
-    """يبحث عن أول مفتاح موجود في القاموس."""
+def _g(obj: dict, *keys):
+    """يبحث عن أول مفتاح موجود."""
     for k in keys:
         if obj and k in obj and obj[k] is not None:
             return obj[k]
-    return default
-
-
-def _extract_job_info(job_raw, index: int = 0) -> dict:
-    """
-    يستخرج معلومات العملية بمرونة تامة.
-    
-    يتعامل مع:
-      - البيانات المغلفة في 'value' (OB2)
-      - أسماء حقول مختلفة بين إصدارات OB
-      - العمليات المتعددة بنفس الاسم (يضيف رقم)
-    """
-    if not isinstance(job_raw, dict):
-        return None
-
-    # فك غلاف OB2
-    job = _unwrap_ob2(job_raw)
-
-    # ---- استخراج الاسم ----
-    # OB2 يضع اسم الكونفق أحياناً داخل كائن config
-    name = _get(job, "name", "jobName", "configName")
-    if not name:
-        config_obj = _get(job, "config")
-        if isinstance(config_obj, dict):
-            name = _get(config_obj, "name", "configName")
-    if not name:
-        name = f"عملية {index + 1}"
-
-    # ---- استخراج الحالة ----
-    status = _get(job, "status", "state", "jobStatus")
-
-    # ---- استخراج التقدم ----
-    # OB2 يستخدم completionRatio (0.0 - 1.0) أو percent
-    progress = _get(
-        job,
-        "progress", "completionRatio", "completionRate",
-        "percent", "completion", "value"
-    )
-
-    # ---- استخراج السرعة ----
-    # OB2 يستخدم checkSpeed
-    cpm = _get(job, "cpm", "speed", "checkSpeed", "checksPerMinute")
-
-    # ---- استخراج Hits ----
-    # OB2 يفرق بين goodCount و customCount
-    hits = _get(job, "hits", "hitsCount", "good", "goodCount", "success")
-    custom = _get(job, "custom", "customCount", "captured")
-
-    # ---- استخراج إحصائيات إضافية ----
-    total_checks = _get(job, "total", "totalChecks", "checked", "dataTested")
-    bad = _get(job, "bad", "badCount", "fail", "failed", "toCheck")
-    proxies_tested = _get(job, "proxiesTested", "proxyTested")
-
-    # ---- معرّف العملية ----
-    job_id = _get(job, "id", "itemId", "guid")
-
-    return {
-        "name": str(name).strip(),
-        "status": status,
-        "progress": progress,
-        "cpm": cpm,
-        "hits": hits,
-        "custom": custom,
-        "total": total_checks,
-        "bad": bad,
-        "proxies_tested": proxies_tested,
-        "job_id": job_id,
-        "index": index,
-        # نحتفظ بالقاموس الأصلي بعد فك الغلاف للتصحيح
-        "_all_keys": list(job.keys()),
-    }
-
-
-def _is_active(status_val) -> bool:
-    if status_val is None:
-        return False
-    s = str(status_val).strip().lower()
-    return s in ("running", "active", "started", "executing")
+    return None
 
 
 def _num(val, fallback=0) -> int:
-    """يحول القيمة لرقم بأمان."""
     try:
         return int(float(val)) if val is not None else fallback
     except (TypeError, ValueError):
         return fallback
 
 
+def _is_active(status_val) -> bool:
+    if status_val is None:
+        return False
+    return str(status_val).strip().lower() in ("running", "active", "started", "executing")
+
+
+async def fetch_ob_status() -> dict:
+    """
+    الاستراتيجية الجديدة:
+      1. المصادقة التلقائية (3 صيغ)
+      2. جلب قائمة العمليات من /api/v1/job/all
+      3. فلتر العمليات النشطة
+      4. لكل عملية نشطة، جلب تفاصيلها من /api/v1/job/{id}
+      5. دمج البيانات الأساسية مع التفصيلية
+    """
+    if not OPENBULLET_URL or not OPENBULLET_API_KEY:
+        return {"error": "متغيرات البيئة غير مكتملة.", "jobs": [], "monitors": []}
+
+    base = OPENBULLET_URL.strip().rstrip("/")
+    raw_key = OPENBULLET_API_KEY.strip()
+
+    # ---- الخطوة 1: المصادقة ----
+    headers, auth_label = await _auto_auth(base, raw_key)
+    if not headers:
+        return {
+            "error": (
+                "فشلت كل صيغ المصادقة.\n\n"
+                f"🔗 الرابط: `{base}`\n"
+                f"🔑 المفتاح: `{raw_key}`\n\n"
+                "**تأكد:**\n"
+                "1. OB → Settings → General\n"
+                "2. Admin API Key → الصق المفتاح\n"
+                "3. Save Settings"
+            ),
+            "jobs": [],
+            "monitors": [],
+        }
+
+    result = {
+        "auth_method": auth_label,
+        "jobs": [],       # العمليات النشطة مع تفاصيلها الكاملة
+        "monitors": [],
+        "total_all": 0,   # إجمالي العمليات
+    }
+
+    async with httpx.AsyncClient(verify=False, timeout=15.0) as client:
+
+        # ---- الخطوة 2: جلب القائمة ----
+        try:
+            resp = await client.get(f"{base}/api/v1/job/all", headers=headers)
+            if resp.status_code != 200:
+                return {
+                    "error": f"فشل جلب القائمة: HTTP {resp.status_code}",
+                    "jobs": [], "monitors": [],
+                }
+
+            list_data = resp.json()
+            if isinstance(list_data, dict) and "items" in list_data:
+                all_jobs = list_data["items"]
+            elif isinstance(list_data, list):
+                all_jobs = list_data
+            else:
+                all_jobs = []
+
+            result["total_all"] = len(all_jobs)
+
+        except Exception as e:
+            return {"error": f"خطأ في جلب القائمة: {e}", "jobs": [], "monitors": []}
+
+        # ---- الخطوة 3: فلتر النشطة ----
+        running_ids = []
+        for j in all_jobs:
+            if not isinstance(j, dict):
+                continue
+            status = j.get("status", "")
+            if _is_active(status):
+                job_id = j.get("id")
+                if job_id is not None:
+                    running_ids.append({
+                        "id": job_id,
+                        "name": j.get("name", "بدون اسم"),
+                        "status": status,
+                    })
+
+        if not running_ids:
+            return result  # لا عمليات نشطة
+
+        # ---- الخطوة 4: جلب تفاصيل كل عملية نشطة ----
+        for item in running_ids:
+            job_id = item["id"]
+            detail = {
+                "id": job_id,
+                "name": item["name"],
+                "status": item["status"],
+                "progress": None,
+                "cpm": None,
+                "hits": None,
+                "custom": None,
+                "total": None,
+                "bad": None,
+                "raw_keys": [],
+            }
+
+            try:
+                resp = await client.get(
+                    f"{base}/api/v1/job/{job_id}",
+                    headers=headers
+                )
+                if resp.status_code == 200:
+                    raw = resp.json()
+                    # فك الغلاف إن وُجد
+                    unwrapped = _unwrap(raw) if isinstance(raw, dict) else raw
+
+                    if isinstance(unwrapped, dict):
+                        detail["raw_keys"] = list(unwrapped.keys())
+                        logger.info(f"Job {job_id} detail keys: {detail['raw_keys']}")
+
+                        # استخراج القيم بأسماء متعددة
+                        detail["progress"] = _g(
+                            unwrapped,
+                            "progress", "completionRatio", "completionRate",
+                            "percent", "completion"
+                        )
+                        detail["cpm"] = _g(
+                            unwrapped,
+                            "cpm", "speed", "checkSpeed", "checksPerMinute"
+                        )
+                        detail["hits"] = _g(
+                            unwrapped,
+                            "hits", "hitsCount", "good", "goodCount", "success"
+                        )
+                        detail["custom"] = _g(
+                            unwrapped,
+                            "custom", "customCount", "captured"
+                        )
+                        detail["total"] = _g(
+                            unwrapped,
+                            "total", "totalChecks", "checked", "dataTested"
+                        )
+                        detail["bad"] = _g(
+                            unwrapped,
+                            "bad", "badCount", "fail", "failed", "toCheck"
+                        )
+
+                        # تحديث الاسم إن وُجد أكثر دقة في التفاصيل
+                        better_name = _g(unwrapped, "name", "jobName", "configName")
+                        if better_name:
+                            detail["name"] = better_name
+
+                else:
+                    logger.warning(f"Job {job_id} detail returned HTTP {resp.status_code}")
+
+            except Exception as e:
+                logger.error(f"Error fetching job {job_id} detail: {e}")
+
+            result["jobs"].append(detail)
+
+        # ---- الخطوة 5: مراقبات العمليات (إن وُجدت) ----
+        try:
+            resp = await client.get(f"{base}/api/v1/jobmonitor/all", headers=headers)
+            if resp.status_code == 200:
+                mon_data = resp.json()
+                monitors = []
+                if isinstance(mon_data, dict) and "items" in mon_data:
+                    monitors = mon_data["items"]
+                elif isinstance(mon_data, list):
+                    monitors = mon_data
+
+                for m in monitors:
+                    if not isinstance(m, dict):
+                        continue
+                    if _is_active(m.get("status")):
+                        uw = _unwrap(m)
+                        result["monitors"].append({
+                            "name": _g(uw, "name") or "مراقب",
+                            "progress": _g(uw, "progress", "completionRatio"),
+                            "cpm": _g(uw, "cpm", "checkSpeed"),
+                            "hits": _g(uw, "hits", "goodCount"),
+                            "custom": _g(uw, "custom", "customCount"),
+                            "total": _g(uw, "total", "totalChecks"),
+                            "bad": _g(uw, "bad", "badCount"),
+                        })
+        except Exception as e:
+            logger.error(f"Error fetching monitors: {e}")
+
+    return result
+
+
 def format_ob_message(ob_data: dict) -> str:
-    """يحوّل بيانات OpenBullet إلى رسالة تلغرام منسّقة."""
+    """يحوّل البيانات لرسالة تلغرام."""
 
-    if "diag_error" in ob_data:
-        return f"❌ **خطأ في الإعدادات:**\n{ob_data['diag_error']}"
-
-    # ---- استخراج العمليات ----
-    raw_jobs = ob_data.get("jobs", [])
-    raw_monitors = ob_data.get("monitors", [])
-
-    running_jobs = []
-    for i, j in enumerate(raw_jobs):
-        info = _extract_job_info(j, i)
-        if info and _is_active(info["status"]):
-            running_jobs.append(info)
-
-    running_monitors = []
-    for i, m in enumerate(raw_monitors):
-        info = _extract_job_info(m, i)
-        if info and _is_active(info["status"]):
-            running_monitors.append(info)
-
-    total_active = len(running_jobs) + len(running_monitors)
-    total_all = len(raw_jobs) + len(raw_monitors)
+    if "error" in ob_data and ob_data.get("jobs") is None:
+        return f"❌ **خطأ:**\n{ob_data['error']}"
 
     auth_line = ""
     if ob_data.get("auth_method"):
         auth_line = f"🔑 **المصادقة:** `{ob_data['auth_method']}`\n"
 
-    # ---- لا عمليات نشطة ----
+    jobs = ob_data.get("jobs", [])
+    monitors = ob_data.get("monitors", [])
+    total_all = ob_data.get("total_all", 0)
+    total_active = len(jobs) + len(monitors)
+
     if total_active == 0:
         return (
             "💤 **حالة الـ Mainframe:** `خامل (IDLE)`\n\n"
@@ -444,7 +438,6 @@ def format_ob_message(ob_data: dict) -> str:
             "_لا توجد عمليات فحص نشطة حالياً._"
         )
 
-    # ---- عمليات نشطة ----
     lines = [
         "⚙️ **「 شاشة مراقبة OPENBULLET 」** ⚙️\n",
         auth_line,
@@ -452,17 +445,15 @@ def format_ob_message(ob_data: dict) -> str:
         "━━━━━━━━━━━━━━━━━━━━",
     ]
 
-    # تجميع أسماء متكررة لتمييزها
+    # تمييز العمليات المتكررة
     name_count = {}
-    for j in running_jobs:
+    for j in jobs:
         n = j["name"]
         name_count[n] = name_count.get(n, 0) + 1
-
     name_seen = {}
-    for job in running_jobs:
-        name = safe_md(job["name"])
 
-        # إذا كان الاسم مكرراً نضيف رقم
+    for job in jobs:
+        name = safe_md(job["name"])
         if name_count.get(job["name"], 0) > 1:
             name_seen[job["name"]] = name_seen.get(job["name"], 0) + 1
             name = f"{name} #{name_seen[job['name']]}"
@@ -475,12 +466,7 @@ def format_ob_message(ob_data: dict) -> str:
         progress = resolve_progress(job["progress"])
 
         lines.append(f"📦 **عملية:** `{name}`")
-
-        # إضافة معرّف قصير إن وُجد
-        if job.get("job_id"):
-            short_id = str(job["job_id"])[:8]
-            lines.append(f"   🆔 المعرف: `{short_id}...`")
-
+        lines.append(f"   🆔 المعرف: `{job['id']}`")
         lines.append(f"   📊 التقدم: `{progress}%`")
 
         if total > 0:
@@ -497,7 +483,7 @@ def format_ob_message(ob_data: dict) -> str:
         lines.append(f"   ⚡ السرعة: `{cpm}` CPM")
         lines.append("━━━━━━━━━━━━━━━━━━━━")
 
-    for mon in running_monitors:
+    for mon in monitors:
         name = safe_md(mon["name"])
         hits = _num(mon["hits"])
         custom = _num(mon["custom"])
@@ -507,7 +493,6 @@ def format_ob_message(ob_data: dict) -> str:
 
         lines.append(f"🔄 **مراقب مستمر:** `{name}`")
         lines.append(f"   📊 التقدم: `{progress}%`")
-
         if total > 0:
             lines.append(f"   📋 تم فحص: `{total}`")
         lines.append(f"   🎯 Hits: `{hits}`")
@@ -776,54 +761,75 @@ def health_check():
 @app.get("/debug/ob")
 async def debug_ob():
     """
-    تشخيص شامل: يعرض البنية الخام + البيانات المستخرجة.
-    
-    افتحه في المتصفح:
-    https://your-app.onrender.com/debug/ob
-    
-    يُظهر:
-      - أول عملية خام كما جاءت من API
-      - نفس العملية بعد فك غلاف 'value'
-      - البيانات المستخرجة النهائية
+    تشخيص شامل يعرض:
+      1. قائمة العمليات (خفيفة)
+      2. تفاصيل أول عملية نشطة (كاملة)
+      3. أسماء الحقول المتوفرة في التفاصيل
     """
     ob_data = await fetch_ob_status()
-    raw_jobs = ob_data.get("jobs", [])
 
-    # تحليل أول عملية فقط للتصحيح
-    analysis = {}
-    if raw_jobs and isinstance(raw_jobs[0], dict):
-        original = raw_jobs[0]
-        unwrapped = _unwrap_ob2(original)
-        extracted = _extract_job_info(raw_jobs[0], 0)
-
-        analysis = {
-            "original_keys": list(original.keys()) if isinstance(original, dict) else "not a dict",
-            "had_value_wrapper": "value" in original and isinstance(original.get("value"), dict),
-            "unwrapped_keys": list(unwrapped.keys()) if isinstance(unwrapped, dict) else "not a dict",
-            "extracted_info": extracted,
-            # نعرض قيم الحقول المهمة كما هي في الأصل (قبل التحويل)
-            "raw_field_values": {
-                k: unwrapped.get(k) for k in [
-                    "name", "status", "progress", "completionRatio",
-                    "cpm", "checkSpeed", "hits", "goodCount",
-                    "total", "totalChecks", "bad", "badCount",
-                    "custom", "customCount", "config"
-                ] if k in unwrapped
-            }
-        }
-
-    return {
-        "config": {
-            "url": OPENBULLET_URL,
-            "auth": ob_data.get("auth_method"),
-        },
-        "totals": {
-            "jobs_raw_count": len(raw_jobs),
-            "monitors_raw_count": len(ob_data.get("monitors", [])),
-        },
-        "first_job_analysis": analysis,
-        "all_jobs_extracted": [_extract_job_info(j, i) for i, j in enumerate(raw_jobs)],
+    debug_info = {
+        "auth": ob_data.get("auth_method"),
+        "total_all": ob_data.get("total_all", 0),
+        "active_count": len(ob_data.get("jobs", [])),
+        "jobs_list_only": [],  # القائمة الخفيفة من /job/all
+        "job_detail_raw": None,  # تفاصيل أول عملية نشطة
     }
+
+    # نجلب القائمة الخفيفة للتوضيح
+    if OPENBULLET_URL and OPENBULLET_API_KEY:
+        base = OPENBULLET_URL.strip().rstrip("/")
+        _, headers = await _auto_auth(base, OPENBULLET_API_KEY.strip())
+        if headers:
+            async with httpx.AsyncClient(verify=False, timeout=15.0) as client:
+                try:
+                    resp = await client.get(f"{base}/api/v1/job/all", headers=headers)
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        items = data.get("items", data) if isinstance(data, dict) else data
+                        debug_info["jobs_list_only"] = items
+
+                        # نجلب تفاصيل أول عملية نشطة
+                        for j in (items if isinstance(items, list) else []):
+                            if isinstance(j, dict) and _is_active(j.get("status")):
+                                jid = j.get("id")
+                                if jid is not None:
+                                    resp2 = await client.get(
+                                        f"{base}/api/v1/job/{jid}", headers=headers
+                                    )
+                                    if resp2.status_code == 200:
+                                        debug_info["job_detail_raw"] = resp2.json()
+                                    else:
+                                        debug_info["job_detail_raw"] = {
+                                            "error": f"HTTP {resp2.status_code}",
+                                            "body": resp2.text[:500],
+                                        }
+                                    break
+                except Exception as e:
+                    debug_info["fetch_error"] = str(e)
+
+    return debug_info
+
+
+@app.get("/debug/job/{job_id}")
+async def debug_job(job_id: int):
+    """يعرض تفاصيل عملية واحدة بالكامل كما جاءت من API."""
+    if not OPENBULLET_URL or not OPENBULLET_API_KEY:
+        return {"error": "missing config"}
+
+    base = OPENBULLET_URL.strip().rstrip("/")
+    _, headers = await _auto_auth(base, OPENBULLET_API_KEY.strip())
+
+    if not headers:
+        return {"error": "Auth failed"}
+
+    async with httpx.AsyncClient(verify=False, timeout=15.0) as client:
+        resp = await client.get(f"{base}/api/v1/job/{job_id}", headers=headers)
+        return {
+            "status_code": resp.status_code,
+            "content_type": resp.headers.get("content-type", ""),
+            "raw_json": resp.json() if resp.status_code == 200 else resp.text[:1000],
+        }
 
 
 @app.post("/setup/webhook")
