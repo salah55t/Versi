@@ -157,6 +157,11 @@ async def tg_answer(callback_id: str, text: str, show_alert: bool = False):
 
 
 async def get_auth_headers() -> tuple:
+    """
+    يجرب 3 صيغ مصادقة ويرجع (headers_dict, label_string).
+    يُرجع (None, None) إذا فشلت كلها.
+    مُغلف بـ try/except لمنع الانهيار.
+    """
     if not OPENBULLET_URL or not OPENBULLET_API_KEY:
         return None, None
 
@@ -189,6 +194,7 @@ async def get_auth_headers() -> tuple:
 
 
 def _unwrap(obj) -> dict:
+    """يفك غلاف 'value' إن وُجد."""
     if not isinstance(obj, dict):
         return obj
     if "value" in obj and isinstance(obj["value"], dict):
@@ -199,6 +205,7 @@ def _unwrap(obj) -> dict:
 
 
 def _g(obj, *keys):
+    """يبحث عن أول مفتاح موجود في القاموس."""
     if not isinstance(obj, dict):
         return None
     for k in keys:
@@ -221,6 +228,10 @@ def _is_active(status_val) -> bool:
 
 
 def _extract_detail(raw: dict) -> dict:
+    """
+    يستخرج البيانات من رد /api/v1/job/{id}
+    بمرونة تامة لأي اسم حقول.
+    """
     uw = _unwrap(raw) if isinstance(raw, dict) else {}
     return {
         "progress": _g(uw, "progress", "completionRatio", "completionRate", "percent", "completion"),
@@ -236,6 +247,13 @@ def _extract_detail(raw: dict) -> dict:
 
 
 async def fetch_ob_status() -> dict:
+    """
+    الاستراتيجية:
+      1. مصادقة تلقائية
+      2. /job/all → قائمة العمليات
+      3. فلتر النشطة
+      4. /job/{id} → تفاصيل كل عملية نشطة
+    """
     headers, auth_label = await get_auth_headers()
 
     if not headers:
@@ -262,6 +280,8 @@ async def fetch_ob_status() -> dict:
 
     try:
         async with httpx.AsyncClient(verify=False, timeout=15.0) as client:
+
+            # ---- قائمة العمليات ----
             resp = await client.get(f"{base}/api/v1/job/all", headers=headers)
             if resp.status_code != 200:
                 return {**result, "error": f"قائمة العمليات: HTTP {resp.status_code}"}
@@ -274,12 +294,14 @@ async def fetch_ob_status() -> dict:
             )
             result["total_all"] = len(all_jobs)
 
+            # ---- فلتر النشطة ----
             active_items = [
                 {"id": j["id"], "name": j.get("name", "بدون اسم"), "status": j.get("status")}
                 for j in all_jobs
                 if isinstance(j, dict) and j.get("id") is not None and _is_active(j.get("status"))
             ]
 
+            # ---- جلب تفاصيل كل عملية نشطة ----
             for item in active_items:
                 detail = {
                     "id": item["id"],
@@ -309,6 +331,7 @@ async def fetch_ob_status() -> dict:
 
                 result["jobs"].append(detail)
 
+            # ---- مراقبات ----
             try:
                 resp3 = await client.get(f"{base}/api/v1/jobmonitor/all", headers=headers)
                 if resp3.status_code == 200:
@@ -342,6 +365,8 @@ async def fetch_ob_status() -> dict:
 
 
 def format_ob_message(ob_data: dict) -> str:
+    """يحوّل البيانات لرسالة تلغرام."""
+
     if "error" in ob_data and not ob_data.get("jobs"):
         return f"❌ **خطأ:**\n{ob_data['error']}"
 
@@ -368,6 +393,7 @@ def format_ob_message(ob_data: dict) -> str:
         "━━━━━━━━━━━━━━━━━━━━",
     ]
 
+    # تمييز الأسماء المتكررة
     name_count = {}
     for j in jobs:
         name_count[j["name"]] = name_count.get(j["name"], 0) + 1
@@ -479,6 +505,7 @@ async def telegram_webhook(request: Request):
     try:
         payload = await request.json()
 
+        # ========== CALLBACK ==========
         if "callback_query" in payload:
             cb = payload["callback_query"]
             callback_id = cb["id"]
@@ -560,6 +587,7 @@ async def telegram_webhook(request: Request):
 
             return {"status": "ok"}
 
+        # ========== TEXT ==========
         if "message" not in payload or "text" not in payload["message"]:
             return {"status": "ignored"}
 
@@ -653,14 +681,19 @@ async def telegram_webhook(request: Request):
 
 # ==================== DEBUG ENDPOINTS ====================
 
-# تم التحديث هنا: ليتعامل FastAPI مع طلبات GET و HEAD معاً بشكل ممتاز
-@app.route("/health", methods=["GET", "HEAD"])
-def health_check(request: Request):
+
+@app.get("/health")
+def health_check():
     return {"status": "healthy"}
 
 
 @app.get("/debug/ob")
 async def debug_ob():
+    """
+    تشخيص شامل يعرض:
+      - القائمة الخفيفة من /job/all
+      - تفاصيل أول عملية نشطة من /job/{id}
+    """
     try:
         headers, auth_label = await get_auth_headers()
 
@@ -680,14 +713,15 @@ async def debug_ob():
         }
 
         async with httpx.AsyncClient(verify=False, timeout=15.0) as client:
+            # القائمة
             try:
-                # تم إزالة رمز الـ Backtick الزائد من هنا ليعمل السكريبت بدون مشاكل
                 resp = await client.get(f"{base}/api/v1/job/all", headers=headers)
                 if resp.status_code == 200:
                     data = resp.json()
                     items = data.get("items", data) if isinstance(data, dict) else data
                     result["jobs_list"] = items if isinstance(items, list) else []
 
+                    # تفاصيل أول عملية نشطة
                     for j in result["jobs_list"]:
                         if isinstance(j, dict) and _is_active(j.get("status")) and j.get("id") is not None:
                             resp2 = await client.get(f"{base}/api/v1/job/{j['id']}", headers=headers)
@@ -715,6 +749,10 @@ async def debug_ob():
 
 @app.get("/debug/job/{job_id}")
 async def debug_job(job_id: int):
+    """
+    يعرض تفاصيل عملية واحدة بالكامل كما جاءت من API.
+    آمن تماماً ضد أي خطأ.
+    """
     try:
         if not OPENBULLET_URL or not OPENBULLET_API_KEY:
             return {"error": "متغيرات البيئة غير مكتملة", "url": OPENBULLET_URL, "has_key": bool(OPENBULLET_API_KEY)}
