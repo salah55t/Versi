@@ -3,6 +3,7 @@ import httpx
 import os
 import logging
 import hashlib
+import time
 from sqlalchemy import create_engine, Column, Integer, String, Boolean, func
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
@@ -679,7 +680,17 @@ async def telegram_webhook(request: Request):
         db.close()
 
 
-# ==================== DEBUG ENDPOINTS ====================
+# ==================== KEEP-ALIVE & DEBUG ENDPOINTS ====================
+
+
+@app.get("/ping")
+def keep_alive():
+    """نقطة نهاية لطلبات Cron Job لمنع نوم السيرفر على Render"""
+    return {
+        "status": "alive",
+        "service": "OB_Bridge",
+        "timestamp": time.time()
+    }
 
 
 @app.get("/health")
