@@ -653,7 +653,7 @@ async def telegram_webhook(request: Request):
 
 # ==================== DEBUG ENDPOINTS ====================
 
-# التعديل هنا: جعلنا هذا المسار يستجيب لـ GET و HEAD معاً لضمان تفعيله بواسطة الكرون جوب
+# تم التحديث هنا: ليتعامل FastAPI مع طلبات GET و HEAD معاً بشكل ممتاز
 @app.route("/health", methods=["GET", "HEAD"])
 def health_check(request: Request):
     return {"status": "healthy"}
@@ -681,7 +681,8 @@ async def debug_ob():
 
         async with httpx.AsyncClient(verify=False, timeout=15.0) as client:
             try:
-                `resp = await client.get(f"{base}/api/v1/job/all", headers=headers)
+                # تم إزالة رمز الـ Backtick الزائد من هنا ليعمل السكريبت بدون مشاكل
+                resp = await client.get(f"{base}/api/v1/job/all", headers=headers)
                 if resp.status_code == 200:
                     data = resp.json()
                     items = data.get("items", data) if isinstance(data, dict) else data
