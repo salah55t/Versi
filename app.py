@@ -1,6 +1,6 @@
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║           🔥 CYBERPUNK DISTRIBUTOR CORE v5.2 PRO EDITION 🔥                 ║
+║           🔥 CYBERPUNK DISTRIBUTOR CORE v5.3 PRO EDITION 🔥                 ║
 ║                                                                              ║
 ║  Professional Telegram Bot Bridge for OpenBullet Account Distribution       ║
 ║  Features: Advanced User Management, Audit Trail, Reservations,            ║
@@ -22,11 +22,11 @@ import re
 import asyncio
 import csv
 import io
+import tempfile
 from functools import wraps
 from typing import Optional, List, Dict, Any
 from collections import defaultdict, deque
 from contextlib import contextmanager
-import tempfile
 
 from sqlalchemy import (
     create_engine, Column, Integer, String, Boolean, func,
@@ -79,7 +79,7 @@ console_handler.setFormatter(ColoredFormatter(
 
 logger = logging.getLogger("CYBER-CORE")
 logger.info("╔═══════════════════════════════════════════════════════════════╗")
-logger.info("║  🔥 CYBERPUNK DISTRIBUTOR CORE v5.2 PRO - INITIALIZING... 🔥  ║")
+logger.info("║  🔥 CYBERPUNK DISTRIBUTOR CORE v5.3 PRO - INITIALIZING... 🔥  ║")
 logger.info("╚═══════════════════════════════════════════════════════════════╝")
 
 # ═══════════════════════════════════════════════════════════
@@ -89,7 +89,7 @@ logger.info("╚═════════════════════�
 app = FastAPI(
     title="Cyberpunk Distributor Core",
     description="Professional Account Distribution System with Advanced Management",
-    version="5.2.0",
+    version="5.3.0",
     docs_url="/docs",
     redoc_url="/redoc",
 )
@@ -239,79 +239,106 @@ class SystemStats(Base):
 
 
 # ═══════════════════════════════════════════════════════════
-#         ★★★ DATABASE MIGRATION (الإصلاح الأساسي) ★★★
+#         ★★★ SMART DATABASE MIGRATION ★★★
 # ═══════════════════════════════════════════════════════════
+
+_TYPE_MAP = {
+    Integer:      "INTEGER",
+    String:       "VARCHAR",
+    Boolean:      "BOOLEAN",
+    Text:         "TEXT",
+    DateTime:     "TIMESTAMP",
+}
+
+
+def _col_to_pg(col) -> str:
+    """تحويل نوع عمود SQLAlchemy إلى تعريف PostgreSQL كامل"""
+    col_type = type(col.type)
+    pg_type = _TYPE_MAP.get(col_type, "TEXT")
+
+    if col_type == String and col.type.length:
+        pg_type = f"VARCHAR({col.type.length})"
+
+    parts = [pg_type]
+
+    if col.default is not None and col.default.is_scalar:
+        val = col.default.arg
+        if isinstance(val, bool):
+            parts.append(f"DEFAULT {'TRUE' if val else 'FALSE'}")
+        elif isinstance(val, str):
+            parts.append(f"DEFAULT '{val}'")
+        elif isinstance(val, int):
+            parts.append(f"DEFAULT {val}")
+
+    result = " ".join(parts)
+
+    if col.foreign_keys:
+        for fk in col.foreign_keys:
+            result += f" REFERENCES {fk.target_fullname}"
+
+    return result
+
 
 def migrate_database():
     """
-    إضافة الأعمدة الناقصة للجداول الموجودة.
-    create_all() لا يضيف أعمدة جديدة - لذلك نستخدم ALTER TABLE.
+    هجرة ذكية شاملة:
+    تقارن كل عمود في كل نموذج مع الجدول الفعلي في قاعدة البيانات
+    وتضيف أي عمود ناقص تلقائياً عبر ALTER TABLE.
     """
     db_inspector = inspect(engine)
+    existing_tables = set(db_inspector.get_table_names())
 
-    with engine.begin() as conn:
-        # ── هجرة جدول accounts ──
-        if 'accounts' in db_inspector.get_table_names():
-            existing = {c['name'] for c in db_inspector.get_columns('accounts')}
-            cols_to_add = {
-                'created_at':    "TIMESTAMP DEFAULT NOW()",
-                'given_at':      "TIMESTAMP",
-                'given_to':      "VARCHAR(50)",
-                'source_job':    "VARCHAR(255)",
-                'quality_score': "INTEGER DEFAULT 100",
-                'tags':          "VARCHAR(500) DEFAULT ''",
-            }
-            for col_name, col_def in cols_to_add.items():
-                if col_name not in existing:
-                    try:
-                        conn.execute(text(
-                            f"ALTER TABLE accounts ADD COLUMN {col_name} {col_def}"
-                        ))
-                        logger.info(f"✅ Migration: Added accounts.{col_name}")
-                    except Exception as e:
-                        logger.error(f"❌ Migration failed accounts.{col_name}: {e}")
+    # إنشاء جداول غير موجودة أصلاً
+    Base.metadata.create_all(bind=engine)
 
-        # ── هجرة جدول delivered_accounts ──
-        if 'delivered_accounts' in db_inspector.get_table_names():
-            existing = {c['name'] for c in db_inspector.get_columns('delivered_accounts')}
-            cols_to_add = {
-                'account_id':    "INTEGER REFERENCES accounts(id)",
-                'delivery_type': "VARCHAR(20) DEFAULT 'claim'",
-            }
-            for col_name, col_def in cols_to_add.items():
-                if col_name not in existing:
-                    try:
-                        conn.execute(text(
-                            f"ALTER TABLE delivered_accounts ADD COLUMN {col_name} {col_def}"
-                        ))
-                        logger.info(f"✅ Migration: Added delivered_accounts.{col_name}")
-                    except Exception as e:
-                        logger.error(f"❌ Migration failed delivered_accounts.{col_name}: {e}")
+    total_added = 0
 
-        # ── هجرة جدول users (أعمدة محتملة ناقصة) ──
-        if 'users' in db_inspector.get_table_names():
-            existing = {c['name'] for c in db_inspector.get_columns('users')}
-            cols_to_add = {
-                'is_banned':        "BOOLEAN DEFAULT FALSE",
-                'ban_reason':       "VARCHAR(500)",
-                'reputation_score': "INTEGER DEFAULT 100",
-                'notes':            "TEXT",
-            }
-            for col_name, col_def in cols_to_add.items():
-                if col_name not in existing:
-                    try:
-                        conn.execute(text(
-                            f"ALTER TABLE users ADD COLUMN {col_name} {col_def}"
-                        ))
-                        logger.info(f"✅ Migration: Added users.{col_name}")
-                    except Exception as e:
-                        logger.error(f"❌ Migration failed users.{col_name}: {e}")
+    for mapper in Base.registry.mappers:
+        model_class = mapper.class_
+        table_name = model_class.__tablename__
 
-    logger.info("✅ Database migration completed")
+        if table_name not in existing_tables:
+            logger.info(f"📋 Table '{table_name}' created by create_all")
+            continue
+
+        # الأعمدة المتوقعة من النموذج
+        model_columns = {}
+        for col in model_class.__table__.columns:
+            model_columns[col.name] = col
+
+        # الأعمدة الفعلية في قاعدة البيانات
+        try:
+            db_columns = {c['name'] for c in db_inspector.get_columns(table_name)}
+        except Exception as e:
+            logger.error(f"❌ Cannot inspect table {table_name}: {e}")
+            continue
+
+        # إيجاد الأعمدة الناقصة
+        missing = set(model_columns.keys()) - db_columns
+
+        if not missing:
+            continue
+
+        with engine.begin() as conn:
+            for col_name in sorted(missing):
+                col = model_columns[col_name]
+                col_def = _col_to_pg(col)
+
+                try:
+                    sql = f"ALTER TABLE {table_name} ADD COLUMN {col_name} {col_def}"
+                    conn.execute(text(sql))
+                    total_added += 1
+                    logger.info(f"  ✅ {table_name}.{col_name} → {col_def}")
+                except Exception as e:
+                    logger.error(f"  ❌ {table_name}.{col_name} FAILED: {e}")
+
+    if total_added > 0:
+        logger.info(f"🎯 Migration complete: {total_added} columns added")
+    else:
+        logger.info("✅ Migration: all columns present, nothing to add")
 
 
-# Create tables first, then migrate
-Base.metadata.create_all(bind=engine)
+# تنفيذ الهجرة
 migrate_database()
 logger.info("✅ Database tables initialized & migrated")
 
@@ -420,10 +447,7 @@ def time_ago(dt: Optional[datetime.datetime]) -> str:
 
 @contextmanager
 def get_db():
-    """
-    ★ مُصلح: لا يُcommit تلقائياً.
-    كل handler يتحكم بcommit الخاص به لتجنب مشاكل الجلسة.
-    """
+    """جلسة قاعدة بيانات بدون auto-commit"""
     db = SessionLocal()
     try:
         yield db
@@ -1230,7 +1254,7 @@ async def receive_hit(request: Request):
 
 
 # ═══════════════════════════════════════════════════════════
-#          ★★★ WEBHOOK: TELEGRAM (الكود المُصلح كاملاً) ★★★
+#                    WEBHOOK: TELEGRAM
 # ═══════════════════════════════════════════════════════════
 
 @app.post("/webhook/telegram")
@@ -1249,7 +1273,6 @@ async def telegram_webhook(request: Request):
             is_admin = chat_id in ADMIN_IDS
             user_info = cb.get("from", {})
 
-            # تسجيل/تحديث المستخدم
             get_or_create_user(db, chat_id, user_info)
 
             # ────────────── claim_cfg: ──────────────
@@ -1271,7 +1294,7 @@ async def telegram_webhook(request: Request):
 
                     banned, reason = is_user_banned(db, chat_id)
                     if banned:
-                        await tg_answer(callback_id, f"🚫 أنت محظور!\nالسبب: {reason}", show_alert=True)
+                        await tg_answer(callback_id, f"🚫 أنت محظور! السبب: {reason}", show_alert=True)
                         return {"status": "ok"}
 
                     if not rate_limiter.is_claim_allowed(chat_id):
@@ -1293,7 +1316,7 @@ async def telegram_webhook(request: Request):
                             mins = int((remaining.total_seconds() % 3600) / 60)
                             await tg_answer(
                                 callback_id,
-                                f"⏳ انتظر: {hours}س {mins}د قبل السحب التالي",
+                                f"⏳ انتظر {hours}س {mins}د قبل السحب التالي",
                                 show_alert=True
                             )
                             return {"status": "ok"}
@@ -1338,10 +1361,11 @@ async def telegram_webhook(request: Request):
                         f"⏳ السحب التالي بعد: {CLAIM_COOLDOWN_SECONDS // 3600} ساعة",
                         reply_markup=None
                     )
+
                 except Exception as e:
-                    logger.error(f"claim_cfg error: {e}", exc_info=True)
                     db.rollback()
-                    await tg_answer(callback_id, f"❌ خطأ: {str(e)[:100]}", show_alert=True)
+                    logger.error(f"claim_cfg error for {chat_id}: {e}", exc_info=True)
+                    await tg_answer(callback_id, "❌ حدث خطأ، حاول مرة أخرى", show_alert=True)
                 return {"status": "ok"}
 
             # ────────────── confirm_reserve: ──────────────
@@ -1405,10 +1429,11 @@ async def telegram_webhook(request: Request):
                     )
                     log_audit(db, chat_id, "reservation_created",
                               f"Reserved {selected}", request)
+
                 except Exception as e:
-                    logger.error(f"confirm_reserve error: {e}", exc_info=True)
                     db.rollback()
-                    await tg_answer(callback_id, f"❌ خطأ: {str(e)[:100]}", show_alert=True)
+                    logger.error(f"confirm_reserve error: {e}", exc_info=True)
+                    await tg_answer(callback_id, "❌ حدث خطأ، حاول مرة أخرى", show_alert=True)
                 return {"status": "ok"}
 
             # ────────────── cancel_reserve: ──────────────
@@ -1455,7 +1480,8 @@ async def telegram_webhook(request: Request):
                     )
                 except Exception as e:
                     db.rollback()
-                    await tg_answer(callback_id, f"❌ خطأ: {e}", show_alert=True)
+                    logger.error(f"reset_delivered error: {e}")
+                    await tg_answer(callback_id, "❌ حدث خطأ", show_alert=True)
                 return {"status": "ok"}
 
             # ────────────── ADMIN: clear_accounts ──────────────
@@ -1475,7 +1501,8 @@ async def telegram_webhook(request: Request):
                     )
                 except Exception as e:
                     db.rollback()
-                    await tg_answer(callback_id, f"❌ خطأ: {e}", show_alert=True)
+                    logger.error(f"clear_accounts error: {e}")
+                    await tg_answer(callback_id, "❌ حدث خطأ", show_alert=True)
                 return {"status": "ok"}
 
             # ────────────── ADMIN: refresh_admin_stats ──────────────
@@ -1510,12 +1537,7 @@ async def telegram_webhook(request: Request):
                     reserved = db.query(Reservation).filter(
                         Reservation.status == "active"
                     ).count()
-                    orphaned = db.query(Account).filter(
-                        Account.is_given == True,
-                        Account.given_to == None
-                    ).count()
 
-                    # Fix orphaned accounts
                     orphaned_fixed = 0
                     orphans = db.query(Account).filter(
                         Account.is_given == True,
@@ -1539,11 +1561,11 @@ async def telegram_webhook(request: Request):
                     await tg_edit(chat_id, message_id, msg,
                                   reply_markup=get_admin_keyboard())
                     log_audit(db, chat_id, "scan_inventory",
-                              f"Found {orphaned} orphaned, fixed {orphaned_fixed}", request)
+                              f"Fixed {orphaned_fixed} orphaned accounts", request)
                 except Exception as e:
                     logger.error(f"scan_inventory error: {e}")
                     db.rollback()
-                await tg_answer(callback_id, "🔍 تم الفحص")
+                    await tg_answer(callback_id, "❌ حدث خطأ", show_alert=True)
                 return {"status": "ok"}
 
             # ────────────── ADMIN: banned_users ──────────────
@@ -1607,8 +1629,10 @@ async def telegram_webhook(request: Request):
                 pending_bans[chat_id] = True
                 await tg_edit(chat_id, message_id,
                     "🚫 *حظر مستخدم*\n\n"
-                    "أرسل معرف المستخدم (user\\_id):\n"
-                    "_مثال: 123456789_",
+                    "أرسل معرف المستخدم:\n"
+                    "`user_id | سبب الحظر`\n"
+                    "_مثال: `123456789 | سبب`_\n"
+                    "_أو أرسل المعرف فقط لحظر بدون سبب._",
                     reply_markup=get_cancel_keyboard()
                 )
                 await tg_answer(callback_id, "أرسل المعرف")
@@ -1750,7 +1774,7 @@ async def telegram_webhook(request: Request):
                               f"Exported {len(export_data)} accounts", request)
                 except Exception as e:
                     logger.error(f"export_json error: {e}")
-                    await tg_answer(callback_id, f"❌ {e}", show_alert=True)
+                    await tg_answer(callback_id, "❌ حدث خطأ", show_alert=True)
                 return {"status": "ok"}
 
             # ────────────── EXPORT: export_csv ──────────────
@@ -1778,13 +1802,13 @@ async def telegram_webhook(request: Request):
                               f"Exported {len(accounts)} accounts", request)
                 except Exception as e:
                     logger.error(f"export_csv error: {e}")
-                    await tg_answer(callback_id, f"❌ {e}", show_alert=True)
+                    await tg_answer(callback_id, "❌ حدث خطأ", show_alert=True)
                 return {"status": "ok"}
 
             # ────────────── EXPORT: export_audit ──────────────
             if data == "export_audit" and is_admin:
                 try:
-                    logs = db.query(AuditLog).order_by(
+                    logs_data = db.query(AuditLog).order_by(
                         desc(AuditLog.timestamp)
                     ).limit(500).all()
                     with tempfile.NamedTemporaryFile(
@@ -1796,7 +1820,7 @@ async def telegram_webhook(request: Request):
                             "action": l.action,
                             "details": l.details,
                             "ip": l.ip_address,
-                        } for l in logs]
+                        } for l in logs_data]
                         json.dump(audit_data, f, ensure_ascii=False, indent=2)
                         tmp_path = f.name
 
@@ -1805,7 +1829,7 @@ async def telegram_webhook(request: Request):
                     os.unlink(tmp_path)
                 except Exception as e:
                     logger.error(f"export_audit error: {e}")
-                    await tg_answer(callback_id, f"❌ {e}", show_alert=True)
+                    await tg_answer(callback_id, "❌ حدث خطأ", show_alert=True)
                 return {"status": "ok"}
 
             # ────────────── EXPORT: full_backup ──────────────
@@ -1844,7 +1868,7 @@ async def telegram_webhook(request: Request):
                     log_audit(db, chat_id, "full_backup", "Full backup created", request)
                 except Exception as e:
                     logger.error(f"full_backup error: {e}")
-                    await tg_answer(callback_id, f"❌ {e}", show_alert=True)
+                    await tg_answer(callback_id, "❌ حدث خطأ", show_alert=True)
                 return {"status": "ok"}
 
             # ────────────── cancel_action ──────────────
@@ -1875,7 +1899,6 @@ async def telegram_webhook(request: Request):
             is_admin = chat_id in ADMIN_IDS
             user_info = msg.get("from", {})
 
-            # تسجيل/تحديث المستخدم
             get_or_create_user(db, chat_id, user_info)
 
             # ── /start ──
@@ -1934,7 +1957,7 @@ async def telegram_webhook(request: Request):
                     )
                 except Exception as e:
                     logger.error(f"Claim menu error: {e}", exc_info=True)
-                    await tg_send(chat_id, f"❌ خطأ: {str(e)[:200]}")
+                    await tg_send(chat_id, "❌ حدث خطأ، حاول مرة أخرى")
                 return {"status": "ok"}
 
             # ── إحصائيات المخزن ──
@@ -2073,7 +2096,7 @@ async def telegram_webhook(request: Request):
                               f"Sent to {sent} users, {failed} failed", request)
                 except Exception as e:
                     logger.error(f"Broadcast error: {e}", exc_info=True)
-                    await tg_send(chat_id, f"❌ خطأ: {str(e)[:200]}")
+                    await tg_send(chat_id, "❌ حدث خطأ في الإرسال")
                 return {"status": "ok"}
 
             # ── Pending: Ban user ──
@@ -2081,7 +2104,6 @@ async def telegram_webhook(request: Request):
                 pending_bans.pop(chat_id, None)
                 target_id = text.strip()
                 try:
-                    # الرد المتوقع: user_id | reason
                     parts = target_id.split("|", 1)
                     uid = parts[0].strip()
                     reason = parts[1].strip() if len(parts) > 1 else "حظر يدوي"
@@ -2102,7 +2124,6 @@ async def telegram_webhook(request: Request):
                             banned_by=chat_id,
                         ))
 
-                    # تحديث جدول users
                     user_obj = db.query(User).filter(User.user_id == uid).first()
                     if user_obj:
                         user_obj.is_banned = True
@@ -2118,7 +2139,7 @@ async def telegram_webhook(request: Request):
                 except Exception as e:
                     db.rollback()
                     logger.error(f"Ban error: {e}", exc_info=True)
-                    await tg_send(chat_id, f"❌ خطأ: {str(e)[:200]}")
+                    await tg_send(chat_id, "❌ حدث خطأ في الحظر")
                 return {"status": "ok"}
 
             # ── Pending: Unban user ──
@@ -2152,7 +2173,7 @@ async def telegram_webhook(request: Request):
                 except Exception as e:
                     db.rollback()
                     logger.error(f"Unban error: {e}", exc_info=True)
-                    await tg_send(chat_id, f"❌ خطأ: {str(e)[:200]}")
+                    await tg_send(chat_id, "❌ حدث خطأ في فك الحظر")
                 return {"status": "ok"}
 
             # ── Pending: Search user ──
@@ -2191,10 +2212,10 @@ async def telegram_webhook(request: Request):
                             f"🕐 آخر نشاط: `{time_ago(user_obj.last_activity)}`")
                 except Exception as e:
                     logger.error(f"Search error: {e}", exc_info=True)
-                    await tg_send(chat_id, f"❌ خطأ: {str(e)[:200]}")
+                    await tg_send(chat_id, "❌ حدث خطأ في البحث")
                 return {"status": "ok"}
 
-            # ── Unknown text (ignore) ──
+            # ── رسالة نصية غير معروفة → تجاهل بصمت ──
             return {"status": "ok"}
 
         return {"status": "ok"}
@@ -2217,7 +2238,7 @@ async def telegram_webhook(request: Request):
 async def root():
     return {
         "status": "online",
-        "version": "5.2.0",
+        "version": "5.3.0",
         "service": "Cyberpunk Distributor Core",
     }
 
@@ -2261,11 +2282,10 @@ async def api_stats():
 
 @app.on_event("startup")
 async def startup_event():
-    logger.info("🚀 CYBERPUNK DISTRIBUTOR CORE v5.2 — READY")
+    logger.info("🚀 CYBERPUNK DISTRIBUTOR CORE v5.3 — READY")
     logger.info(f"🔗 Webhook URL: /webhook/telegram")
     logger.info(f"🔗 Hit Receiver: /webhook/hit")
 
-    # Clean expired reservations on startup
     try:
         db = SessionLocal()
         clean_expired_reservations(db)
